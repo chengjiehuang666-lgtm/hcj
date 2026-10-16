@@ -130,3 +130,21 @@ def test_schema_introspection_lists_business_tables() -> None:
     text = box.schema_as_prompt_text()
     assert "sales" in text
     assert "metric_definitions" in text
+
+
+def test_schema_excludes_framework_tables() -> None:
+    """LangGraph 的 checkpoint_* 表是框架内部表：对分析无用、且是纯噪音。
+
+    实测它们占表结构提示词约 70% 的字符，还可能诱导模型去查框架表。
+    """
+    box = _require_db()
+    text = box.schema_as_prompt_text()
+    for framework_table in ("checkpoint", "langgraph"):
+        assert framework_table not in text, f"表结构里不应出现框架表: {framework_table}"
+
+
+def test_data_ranges_also_exclude_framework_tables() -> None:
+    box = _require_db()
+    text = box.data_ranges_as_prompt_text()
+    assert "sales.stat_date" in text
+    assert "checkpoint" not in text

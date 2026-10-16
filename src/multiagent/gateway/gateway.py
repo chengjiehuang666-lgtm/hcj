@@ -47,6 +47,7 @@ class LLMGateway:
         ModelRouter 具有**完全相同的调用签名**，从而可以直接互换。
         """
         failures: list[tuple[str, str]] = []
+        causes: list[BaseException] = []
         chain: list[str] = []
         started = time.perf_counter()
 
@@ -61,6 +62,7 @@ class LLMGateway:
                 # 避免组装出的错误信息里出现重复的供应商名前缀。
                 reason = getattr(exc, "reason", None) or str(exc)
                 failures.append((provider.name, reason))
+                causes.append(exc)
                 continue
 
             self.history.append(
@@ -90,7 +92,7 @@ class LLMGateway:
                 duration_ms=int((time.perf_counter() - started) * 1000),
             )
         )
-        raise AllProvidersFailedError(failures)
+        raise AllProvidersFailedError(failures, causes)
 
 
 def build_gateway(

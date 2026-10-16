@@ -23,9 +23,14 @@ from multiagent.gateway import (  # noqa: E402
     ROUTE_PLANNER,
     TIER_FAST,
     TIER_REASONING,
+    AllProvidersFailedError,
+    EmptyCompletionError,
     LLMGateway,
     LLMMessage,
+    LLMProvider,
+    LLMResponse,
     ModelRouter,
+    ProviderUnavailableError,
     StubProvider,
     build_gateway_from_providers,
     build_router_from_settings,
@@ -225,3 +230,174 @@ def test_default_settings_fast_tier_points_at_local_non_reasoning_endpoint() -> 
     defaults = Settings(_env_file=None)
     assert defaults.fast_primary.base_url == "http://127.0.0.1:7863/v1"
     assert defaults.fast_fallback.provider == "deepseek"
+
+
+# ------------------------------------------------- 输出上限钳制（fast 档延时的主控制点）
+
+
+class _RecordingProvider(StubProvider):
+    """记录每次调用实际拿到的 max_tokens。"""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.seen_max_tokens: list[int | None] = []
+
+    async def complete(self, messages, *, max_tokens=None, temperature=None):
+        self.seen_max_tokens.append(max_tokens)
+        return await super().complete(messages, max_tokens=max_tokens, temperature=temperature)
+
+
+def _cap_router(caps: dict[str, int]):
+    recorder = _RecordingProvider(name="rec")
+    router = ModelRouter(
+        tiers={TIER_FAST: LLMGateway(primary=recorder)},
+        default_tier=TIER_FAST,
+        output_caps=caps,
+    )
+    return router, recorder
+
+
+def test_router_clamps_oversized_max_tokens_down_to_tier_cap() -> None:
+    """给本地模型过大的输出上限等于邀请它无限思考——必须在网关层掐掉。"""
+    router, recorder = _cap_router({TIER_FAST: 2048})
+    asyncio.run(router.complete([LLMMessage.user("hi")], max_tokens=8192))
+    assert recorder.seen_max_tokens == [2048]
+
+
+def test_router_keeps_smaller_request_untouched() -> None:
+    """调用方要得更少时不应被放大。"""
+    router, recorder = _cap_router({TIER_FAST: 2048})
+    asyncio.run(router.complete([LLMMessage.user("hi")], max_tokens=512))
+    assert recorder.seen_max_tokens == [512]
+
+
+def test_router_applies_tier_cap_when_caller_passes_none() -> None:
+    router, recorder = _cap_router({TIER_FAST: 2048})
+    asyncio.run(router.complete([LLMMessage.user("hi")]))
+    assert recorder.seen_max_tokens == [2048]
+
+
+def test_router_without_cap_for_tier_does_not_clamp() -> None:
+    router, recorder = _cap_router({})
+    asyncio.run(router.complete([LLMMessage.user("hi")], max_tokens=8192))
+    assert recorder.seen_max_tokens == [8192]
+
+
+def test_cap_follows_route_mapping() -> None:
+    """钳制必须随路由走：切到 fast 的调用点才被收紧。"""
+    fast_rec, reason_rec = _RecordingProvider(name="fast"), _RecordingProvider(name="reason")
+    router = ModelRouter(
+        tiers={TIER_FAST: LLMGateway(primary=fast_rec), TIER_REASONING: LLMGateway(primary=reason_rec)},
+        routing={ROUTE_ANALYST_SQL: TIER_FAST, ROUTE_PLANNER: TIER_REASONING},
+        output_caps={TIER_FAST: 2048, TIER_REASONING: 8192},
+    )
+    asyncio.run(router.complete([LLMMessage.user("a")], max_tokens=99999, route=ROUTE_ANALYST_SQL))
+    asyncio.run(router.complete([LLMMessage.user("b")], max_tokens=99999, route=ROUTE_PLANNER))
+    assert fast_rec.seen_max_tokens == [2048]
+    assert reason_rec.seen_max_tokens == [8192]
+
+
+def test_build_router_from_settings_wires_caps_from_settings() -> None:
+    override = Settings(_env_file=None, llm_fast_max_output_tokens=1024, llm_max_output_tokens=4096)
+    router = build_router_from_settings(override)
+    assert router.output_caps[TIER_FAST] == 1024
+    assert router.output_caps[TIER_REASONING] == 4096
+    # 默认路由表下 analyst_sql 走 reasoning，应拿到 reasoning 的上限
+    assert router.output_cap_for(ROUTE_ANALYST_SQL) == 4096
+
+
+def test_fast_tier_cap_is_smaller_than_reasoning_cap_by_default() -> None:
+    defaults = Settings(_env_file=None)
+    assert defaults.llm_fast_max_output_tokens < defaults.llm_max_output_tokens
+
+
+# ---------------------------------------- 截断时放宽一次（收紧上限的配套安全网）
+
+
+class _TruncatingProvider(LLMProvider):
+    """复现真实失效模式：额度不足时把额度全烧在「思考」上，返回空内容。
+
+    本地模型实测就是这样——给 2048 上限时它思考 2048 token 后正文为空。
+    """
+
+    def __init__(self, name: str = "trunc", enough: int = 4096) -> None:
+        self.name = name
+        self.model = "trunc-model"
+        self.enough = enough
+        self.seen_max_tokens: list[int | None] = []
+
+    async def complete(self, messages, *, max_tokens=None, temperature=None) -> LLMResponse:
+        self.seen_max_tokens.append(max_tokens)
+        if max_tokens is None or max_tokens < self.enough:
+            raise EmptyCompletionError(self.name, "length", max_tokens or 0)
+        return LLMResponse(
+            content="ok", provider=self.name, model=self.model, input_tokens=1, output_tokens=1
+        )
+
+    async def health(self) -> bool:
+        return True
+
+
+def _truncating_router(enough: int = 4096):
+    provider = _TruncatingProvider(enough=enough)
+    router = ModelRouter(
+        tiers={TIER_FAST: LLMGateway(primary=provider)},
+        default_tier=TIER_FAST,
+        output_caps={TIER_FAST: 2048},
+    )
+    return router, provider
+
+
+def test_truncated_fast_call_escalates_once_and_succeeds() -> None:
+    """因上限被思考吃满而失败，放宽一次即恢复——不应让任务失败。"""
+    router, provider = _truncating_router()
+    response = asyncio.run(router.complete([LLMMessage.user("hi")], max_tokens=8192))
+    assert response.content == "ok"
+    assert provider.seen_max_tokens == [2048, 8192], provider.seen_max_tokens
+
+
+def test_escalation_is_not_attempted_when_caller_budget_is_already_the_cap() -> None:
+    """调用方原本就只要 1024，则没有「更宽」的额度可放，应如实抛错而不是偷偷放宽。"""
+    router, provider = _truncating_router()
+    with pytest.raises(AllProvidersFailedError):
+        asyncio.run(router.complete([LLMMessage.user("hi")], max_tokens=1024))
+    assert provider.seen_max_tokens == [1024], provider.seen_max_tokens
+
+
+def test_non_truncation_failure_is_not_escalated() -> None:
+    """供应商真挂了就不该靠放宽额度掩盖——必须如实抛出。"""
+    router = ModelRouter(
+        tiers={TIER_REASONING: LLMGateway(primary=StubProvider(name="p", should_fail=True))},
+        default_tier=TIER_REASONING,
+        output_caps={TIER_REASONING: 2048},
+    )
+    with pytest.raises(AllProvidersFailedError):
+        asyncio.run(router.complete([LLMMessage.user("hi")], max_tokens=8192))
+    assert len(router.history) == 1, "非截断失败不应触发额外调用"
+
+
+def test_escalation_records_both_attempts_in_history() -> None:
+    router, _ = _truncating_router()
+    asyncio.run(router.complete([LLMMessage.user("hi")], max_tokens=8192))
+    assert len(router.history) == 2
+    assert router.history[0].ok is False
+    assert router.history[1].ok is True
+    assert all(r.route is None for r in router.history)
+
+
+def test_all_truncated_detection_uses_exception_types_not_text() -> None:
+    from multiagent.gateway.router import _all_truncated
+
+    truncated = AllProvidersFailedError(
+        [("a", "x")], [EmptyCompletionError("a", "length", 2048)]
+    )
+    unrelated = AllProvidersFailedError(
+        [("a", "y")], [ProviderUnavailableError("a", "network down")]
+    )
+    mixed = AllProvidersFailedError(
+        [("a", "x"), ("b", "y")],
+        [EmptyCompletionError("a", "length", 2048), ProviderUnavailableError("b", "down")],
+    )
+    assert _all_truncated(truncated) is True
+    assert _all_truncated(unrelated) is False
+    assert _all_truncated(mixed) is False

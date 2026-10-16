@@ -91,8 +91,15 @@ class EmptyCompletionError(GatewayError):
 class AllProvidersFailedError(GatewayError):
     """主备供应商全部失败。保留全部原因，避免静默失败。"""
 
-    def __init__(self, failures: list[tuple[str, str]]) -> None:
+    def __init__(
+        self,
+        failures: list[tuple[str, str]],
+        causes: list[BaseException] | None = None,
+    ) -> None:
         self.failures = failures
+        #: 原始异常对象。供上层做**类型判断**（例如区分「额度被思考吃满而截断」
+        #: 与「供应商真的挂了」），比匹配错误文本可靠。
+        self.causes: list[BaseException] = list(causes or [])
         detail = "; ".join(f"{p}: {r}" for p, r in failures)
         super().__init__(f"全部供应商调用失败 -> {detail}")
 

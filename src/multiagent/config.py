@@ -88,18 +88,33 @@ class Settings(BaseSettings):
     sql_max_rows: int = 500
     sql_timeout_seconds: int = 10
 
+    # ---- 表结构自省的白名单/黑名单 ----
+    # 排除框架自身建的表。LangGraph 的 PostgresSaver 会在 public schema 下建
+    # checkpoints / checkpoint_blobs / checkpoint_writes / checkpoint_migrations 四张表；
+    # 把它们喂给模型既是噪音（占表结构提示词约 70% 的字符），也可能诱导模型去查框架表。
+    schema_exclude_table_prefixes: list[str] = Field(
+        default_factory=lambda: ["checkpoint", "langgraph", "pg_", "sql_"]
+    )
+
     # ---- 执行预算默认值（对应契约 TaskEvent.budget）----
     default_max_steps: int = 30
     default_max_tokens: int = 200_000  # 待评测集校准，见《实施路线图》待定项 D2
     default_max_retries: int = 2
     default_task_timeout_seconds: int = 300
 
-    # 单次模型调用的输出上限。
-    # max_tokens 只是上限、不用不收费，所以给足以免被截断；
-    # 真正的成本控制由上面的任务级 default_max_tokens 熔断负责。
-    # 实测：推理型模型（deepseek-flash）在「生成结构化 DAG」这类重推理任务上
-    # 需 ~2400 输出 token（其中思考 ~2100），4096 会因思考吃满而截断成空内容。
+    # 单次模型调用的输出上限（reasoning 档）。
+    # max_tokens 只是上限、不用不收费，所以给足以免被截断。
+    # 实测：推理型模型在「生成结构化 DAG」这类重推理任务上需 ~2,400 输出 token，
+    # 4096 会因思考吃满而截断成空内容。
     llm_max_output_tokens: int = 8192
+
+    # fast 档的输出上限。**这是 fast 档延迟的主要控制点**，不是提示词长度。
+    # 实测（输入完全相同，仅改上限）：
+    #   max_tokens=8192 -> 输出 599 token（其中思考 453）、耗时 10.7 秒
+    #   max_tokens=2048 -> 输出 117 token（思考 0）、耗时 4.5 秒
+    # 即：给本地模型过大的上限等于邀请它无限思考。取数只需一条 SQL + 一句话理由，
+    # 2048 足够，同时把「思考失控」这个失效模式从根上掐掉。
+    llm_fast_max_output_tokens: int = 2048
 
     # ---- 派生配置 ----
     @property

@@ -117,6 +117,14 @@ class SqlSandbox:
         self._dsn = settings.postgres_ro_dsn
         self._max_rows = settings.sql_max_rows
         self._timeout = settings.sql_timeout_seconds
+        self._exclude_prefixes = tuple(
+            getattr(settings, "schema_exclude_table_prefixes", ()) or ()
+        )
+
+    def _is_business_table(self, table_name: str) -> bool:
+        """排除框架自身建的表（LangGraph 的 checkpoint_* 等）。"""
+        lowered = table_name.lower()
+        return not any(lowered.startswith(p.lower()) for p in self._exclude_prefixes)
 
     # ---- 内部 ----
     def _wrap(self, sql: str) -> str:
@@ -159,7 +167,11 @@ class SqlSandbox:
         )
 
     def describe_schema(self) -> list[dict[str, Any]]:
-        """返回可查询的表与列，供检索 Agent 判断「有哪些数据可用」。"""
+        """返回**业务表**的表与列，供检索 Agent 判断「有哪些数据可用」。
+
+        框架自身的表（LangGraph 的 checkpoint_* 等）会被排除——它们对分析任务
+        既无用又是噪音。
+        """
         import psycopg
         from psycopg.rows import dict_row
 
@@ -177,9 +189,10 @@ class SqlSandbox:
             ) as conn:
                 with conn.cursor() as cur:
                     cur.execute(query)
-                    return [dict(r) for r in cur.fetchall()]
+                    rows = [dict(r) for r in cur.fetchall()]
         except Exception as exc:
             raise SqlExecutionError(f"读取表结构失败: {exc}") from exc
+        return [r for r in rows if self._is_business_table(r["table_name"])]
 
     def describe_data_ranges(self) -> dict[str, dict[str, Any]]:
         """返回每张表中日期/时间列的**实际取值范围**与行数。
