@@ -21,6 +21,10 @@ agents = [
     "langgraph>=1.0",
     "langgraph-checkpoint-postgres>=3.0",
 ]
+# 知识库 RAG：本地 embedding（fastembed + ONNX），无需在线服务
+rag = [
+    "fastembed>=0.4",
+]
 dev = [
     "pytest>=8.0",
     "jsonschema>=4.23",

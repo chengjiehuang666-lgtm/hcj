@@ -108,6 +108,22 @@ class Settings(BaseSettings):
         default_factory=lambda: ["checkpoint", "langgraph", "pg_", "sql_"]
     )
 
+    # ---- 知识库 / RAG ----
+    # embedding 用**本地**模型（fastembed + ONNX），不依赖在线服务：
+    # 检索每次都要用，走本地没有按次成本，也不受供应商可用性影响。
+    embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    embedding_dim: int = 512
+    # 模型缓存目录。**不要落在系统临时目录**：被清理后要重新下载，
+    # 且会占系统盘（本机 C 盘仅剩 2.8G）。默认放在项目内，已 gitignore。
+    embedding_cache_dir: str = ".model_cache"
+    # 模型下载镜像。直连 HuggingFace 在当前网络不可达，必须走镜像。
+    hf_endpoint: str = "https://hf-mirror.com"
+    rag_chunk_size: int = 320
+    rag_chunk_overlap: int = 60
+    rag_top_k: int = 4
+    # 混合检索里向量分的权重，其余给关键词（pg_trgm）分
+    rag_vector_weight: float = 0.7
+
     # ---- 执行预算默认值（对应契约 TaskEvent.budget）----
     default_max_steps: int = 30
     default_max_tokens: int = 200_000  # 待评测集校准，见《实施路线图》待定项 D2

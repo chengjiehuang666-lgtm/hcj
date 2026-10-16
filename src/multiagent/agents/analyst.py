@@ -41,7 +41,9 @@ _SQL_RULES = """硬性要求：
    存在其它年份或月份——写成范围外的日期会让聚合结果全为 NULL。
 7. **SQL 语法必须能被 PostgreSQL 16 直接执行**：使用 GROUP BY 时，
    非聚合列必须出现在 GROUP BY 中；窗口函数不要与 GROUP BY 混用在非分组列上。
-8. 输出单个 JSON 对象，不要 markdown 围栏：
+8. 下方可能给出「业务背景资料」。它可以帮助你判断**哪些查询才有意义**
+   （例如资料说明数据是月度快照，就不要写日粒度的查询）。
+9. 输出单个 JSON 对象，不要 markdown 围栏：
    {"sql": "<SQL 原文>", "rationale": "<为什么这样查，一句话>"}"""
 
 _SQL_SYSTEM = f"""你是数据分析师的取数环节。你的唯一任务是：把业务问题翻译成一条**只读** SQL 查询。
@@ -62,7 +64,10 @@ _CONCLUDE_SYSTEM = """你是资深数据分析师，负责基于**给定查询�
 4. 若查询结果确实不足以支撑结论，把 insufficient_data 设为 true，
    并在 summary 中**明确说明还缺什么数据**（例如「缺少 8 月基期数据」），不要硬凑结论。
 5. confidence 是 0-1 的数字，表示你对结论的把握程度。
-6. 输出单个 JSON 对象，不要 markdown 围栏：
+6. 下方可能给出「业务背景资料」。它**只能用于解释原因**（例如说明某段时间退货率
+   上升是口径调整而非质量恶化），**严禁把其中的数字当作查询结果引用**——
+   那是编造数据。引用背景资料时请注明出处文档标题。
+7. 输出单个 JSON 对象，不要 markdown 围栏：
    {"summary": "...", "key_findings": ["...", "..."], "insufficient_data": false, "confidence": 0.8}"""
 
 
@@ -76,6 +81,17 @@ class _Conclusion(BaseModel):
     key_findings: list[str] = Field(default_factory=list)
     insufficient_data: bool = False
     confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+def _knowledge_text(knowledge: list[dict], *, limit: int = 4, per_chunk: int = 400) -> str:
+    """把检索到的知识片段压成提示词片段。截断是为控制输入长度与信噪比。"""
+    if not knowledge:
+        return "（无相关背景资料）"
+    lines = []
+    for item in knowledge[:limit]:
+        content = str(item.get("content", "")).replace("\n", " ")[:per_chunk]
+        lines.append(f"《{item.get('title', '?')}》片段{item.get('chunk_index', 0)}：{content}")
+    return "\n".join(lines)
 
 
 class AnalystAgent(BaseAgent):
@@ -114,7 +130,15 @@ class AnalystAgent(BaseAgent):
         )
 
     async def _conclude(
-        self, ctx: AgentContext, *, usage: _Usage, question: str, sql: str, rows_text: str, row_count: int
+        self,
+        ctx: AgentContext,
+        *,
+        usage: _Usage,
+        question: str,
+        sql: str,
+        rows_text: str,
+        row_count: int,
+        knowledge_text: str,
     ) -> _Conclusion:
         return await self.call_json(
             ctx,
@@ -122,7 +146,9 @@ class AnalystAgent(BaseAgent):
             user=(
                 f"业务问题：{question}\n\n"
                 f"实际执行的 SQL：\n{sql}\n\n"
-                f"查询结果（共 {row_count} 行）：\n{rows_text}"
+                f"查询结果（共 {row_count} 行）：\n{rows_text}\n\n"
+                f"业务背景资料（仅可用于解释原因，其中的数字不得当作查询结果）：\n"
+                f"{knowledge_text}"
             ),
             model_cls=_Conclusion,
             usage=usage,
@@ -137,6 +163,7 @@ class AnalystAgent(BaseAgent):
         schema = inv.input.get("schema", "")
         data_ranges = inv.input.get("data_ranges", "")
         definitions = inv.input.get("metric_definitions", {})
+        knowledge = inv.input.get("knowledge", []) or []
         now = inv.input.get("now", "")
         acceptance: list[str] = inv.input.get("acceptance", []) or []
 
@@ -146,13 +173,16 @@ class AnalystAgent(BaseAgent):
             for key, d in definitions.items()
         ) or "（无口径数据）"
         acceptance_text = "\n".join(f"- {a}" for a in acceptance)
+        knowledge_text = _knowledge_text(knowledge)
 
         base_user = (
             f"当前时间：{now}\n\n"
             f"可用表结构：\n{schema}\n\n"
             f"**数据实际覆盖范围（日期条件必须落在此范围内）**：\n"
             f"{data_ranges or '（未取到，请先用可用范围内的日期）'}\n\n"
-            f"指标口径：\n{defs_text}\n\n业务问题：{question}"
+            f"指标口径：\n{defs_text}\n\n"
+            f"业务背景资料（可帮助判断哪些查询才有意义）：\n{knowledge_text}\n\n"
+            f"业务问题：{question}"
         )
 
         best: tuple[_SqlPlan, SqlResult, _Conclusion] | None = None
@@ -189,6 +219,7 @@ class AnalystAgent(BaseAgent):
                     sql=result.sql,
                     rows_text=result.as_prompt_text(),
                     row_count=result.row_count,
+                    knowledge_text=knowledge_text,
                 )
                 if best is None or not conclusion.insufficient_data:
                     best = (plan, result, conclusion)

@@ -48,6 +48,7 @@ class PipelineState(TypedDict, total=False):
     schema: str
     data_ranges: str
     metric_definitions: dict[str, Any]
+    knowledge: list[dict[str, Any]]
     dag: dict[str, Any]
     blackboard: dict[str, Any]
     node_results: list[dict[str, Any]]
@@ -175,6 +176,7 @@ class AnalysisPipeline:
             merge["schema"] = result.outputs.get("schema", "")
             merge["metric_definitions"] = result.outputs.get("metric_definitions", {})
             merge["data_ranges"] = result.outputs.get("data_ranges", "")
+            merge["knowledge"] = result.outputs.get("knowledge", [])
         elif inv.agent_role == "analyst":
             merge["summary"] = result.outputs.get("summary", "")
         return merge
@@ -226,6 +228,7 @@ class AnalysisPipeline:
                     "schema": state.get("schema", ""),
                     "data_ranges": state.get("data_ranges", ""),
                     "metric_definitions": state.get("metric_definitions", {}),
+                    "knowledge": state.get("knowledge", []),
                     "now": state["now"],
                     "acceptance": acceptance,
                 },
