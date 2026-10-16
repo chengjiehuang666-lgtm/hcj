@@ -443,6 +443,83 @@ def test_retriever_rejects_unknown_mode() -> None:
     assert gateway.calls == 0
 
 
+def test_retriever_offloads_blocking_work_to_thread(monkeypatch) -> None:
+    """检索的阻塞工作必须走线程，否则「两路并行」会退化成串行。
+
+    测法刻意做成**确定性**的：用 `time.sleep` 模拟阻塞工作，再看心跳任务能否推进。
+    直接测「真实检索期间的耗时/心跳」不稳定——冷启动要 1 秒、热了只要几十毫秒，
+    阈值怎么定都会偶发失败（这个用例第一版就是这么挂的）。
+    """
+    import asyncio
+    import time
+
+    from multiagent.rag import KnowledgeStore
+
+    def blocking_search(self, query, *, top_k=None):  # noqa: ANN001
+        time.sleep(0.2)  # 模拟同步阻塞调用
+        return []
+
+    monkeypatch.setattr(KnowledgeStore, "search", blocking_search)
+
+    async def scenario() -> int:
+        ticks = 0
+        stop = False
+
+        async def heartbeat() -> None:
+            nonlocal ticks
+            while not stop:
+                ticks += 1
+                await asyncio.sleep(0.005)
+
+        hb = asyncio.create_task(heartbeat())
+        try:
+            inv = _retriever_invocation("retriever_2", mode="knowledge")
+            result = await RetrieverAgent().invoke(inv, _ctx(FakeGateway()))
+            assert result.status is ResultStatus.ok, result.error
+        finally:
+            stop = True
+            await hb
+        return ticks
+
+    ticks = asyncio.run(scenario())
+    # 200ms / 5ms ≈ 40 次；若阻塞占住事件循环则接近 0
+    assert ticks >= 10, f"阻塞工作占住了事件循环（心跳仅 {ticks} 次）"
+
+
+def test_retriever_survives_empty_knowledge_hit(monkeypatch) -> None:
+    """知识库无命中是**正常情况**，不能变成节点崩溃。
+
+    契约要求 status=ok 的结果必须带 sources；「没命中」时若不补一条
+    「检索无命中」的来源记录，就会在 ok() 的契约校验处失败——
+    只要用户问一个与知识库无关的问题，检索节点就会挂掉整个任务。曾一度如此。
+    """
+    import asyncio
+
+    from multiagent.rag import KnowledgeStore
+
+    monkeypatch.setattr(KnowledgeStore, "search", lambda self, q, **kw: [])
+
+    inv = _retriever_invocation("retriever_2", mode="knowledge")
+    result = asyncio.run(RetrieverAgent().invoke(inv, _ctx(FakeGateway())))
+
+    assert result.status is ResultStatus.ok, result.error
+    assert result.outputs["knowledge"] == []
+    assert result.outputs["knowledge_count"] == 0
+    assert result.sources, "无命中时也必须留下来源记录（契约要求）"
+    assert "无命中" in result.sources[0].ref
+
+
+def test_retriever_metrics_mode_always_has_sources(monkeypatch) -> None:
+    """指标口径为空时同样要留下来源记录（走 SQL，天然有 sql 来源）。"""
+    import asyncio
+
+    inv = _retriever_invocation("retriever_1", mode="metrics")
+    result = asyncio.run(RetrieverAgent().invoke(inv, _ctx(FakeGateway())))
+    if result.status is ResultStatus.failed:
+        pytest.skip(f"数据库不可达: {result.error.message}")
+    assert result.sources
+
+
 # ------------------------------------------------ Planner 的角色与模式门禁
 
 

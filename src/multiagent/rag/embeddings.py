@@ -17,6 +17,7 @@ Milvus」是同一类取舍。换模型需同步改：
 from __future__ import annotations
 
 import os
+import threading
 from typing import TYPE_CHECKING
 
 from ..config import Settings
@@ -39,6 +40,10 @@ class LocalEmbedder:
         self._expected_dim = settings.embedding_dim
         self._model: TextEmbedding | None = None
         self._actual_dim: int | None = None
+        # 检索现在跑在线程里（见 retriever 的 asyncio.to_thread），而 embedder 是
+        # 进程内共享的 → 可能被多个线程同时调用。onnxruntime 的会话本身线程安全，
+        # 但 fastembed 的封装未作此保证，加锁是最便宜的保险；编码本身只有毫秒级。
+        self._lock = threading.Lock()
 
     # ---- 模型加载 ----
     def _ensure_model(self) -> "TextEmbedding":
@@ -92,7 +97,8 @@ class LocalEmbedder:
         if not texts:
             return []
         try:
-            vectors = list(self._ensure_model().embed(texts))
+            with self._lock:  # 见 __init__ 里关于线程安全的说明
+                vectors = list(self._ensure_model().embed(texts))
         except Exception as exc:
             raise EmbeddingError(f"生成向量失败: {exc}") from exc
         out = [[float(x) for x in vec] for vec in vectors]

@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -49,7 +50,11 @@ class RetrieverAgent(BaseAgent):
         if not question.strip():
             return [], None
         try:
-            chunks = KnowledgeStore(ctx.settings).search(question)
+            # 走线程：embedding（CPU 推理）与向量检索（同步 psycopg）都是阻塞调用，
+            # 直接在事件循环里跑会占住循环，让本该并行的另一路检索排队等待。
+            chunks = await asyncio.to_thread(
+                lambda: KnowledgeStore(ctx.settings).search(question)
+            )
         except (KnowledgeStoreError, Exception) as exc:  # embedding 也可能失败
             return [], f"{type(exc).__name__}: {exc}"[:300]
         return [
@@ -117,7 +122,12 @@ class RetrieverAgent(BaseAgent):
 
         if mode in (MODE_METRICS, MODE_ALL):
             try:
-                metrics_outputs, metrics_sources = self._metrics_part(ctx)
+                # 同样走线程：schema 自省、数据范围查询都是同步阻塞的 psycopg 调用。
+                # 不这么做的话，「两路检索并行」在实测里会退化成串行——
+                # 事件时间线显示 retriever_2 是等 retriever_1 结束才启动的。
+                metrics_outputs, metrics_sources = await asyncio.to_thread(
+                    self._metrics_part, ctx
+                )
             except SqlToolError as exc:
                 code, retryable = self.classify_error(exc)
                 return self.failed(
@@ -133,9 +143,8 @@ class RetrieverAgent(BaseAgent):
             blackboard_writes.append(f"{inv.node_id}.metrics")
 
         if mode in (MODE_KNOWLEDGE, MODE_ALL):
-            knowledge, knowledge_error = await self._retrieve_knowledge(
-                ctx, inv.input.get("question", "")
-            )
+            question = inv.input.get("question", "")
+            knowledge, knowledge_error = await self._retrieve_knowledge(ctx, question)
             outputs["knowledge"] = knowledge
             outputs["knowledge_count"] = len(knowledge)
             if knowledge_error:
@@ -148,6 +157,17 @@ class RetrieverAgent(BaseAgent):
                 )
                 for c in knowledge
             )
+            if not knowledge:
+                # 检索无命中**也是结果**，必须留下来源记录。
+                # 契约要求 status=ok 的结果必须带 sources，而「没命中」时上面那段
+                # 一条都加不上 → 会在 ok() 处触发契约校验失败，让「知识库无相关内容」
+                # 这种完全正常的情况变成节点崩溃（曾经就是这样）。
+                sources.append(
+                    SourceRef(
+                        type=SourceType.tool,
+                        ref=f"知识库检索无命中（查询：{question[:40]}）",
+                    )
+                )
             blackboard_writes.append(f"{inv.node_id}.knowledge")
 
         # 置信度按「本模式期望的内容是否取到」判定
