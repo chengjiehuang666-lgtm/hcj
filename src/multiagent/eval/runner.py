@@ -75,6 +75,9 @@ class CaseResult:
     #: 按调用点（planner / analyst_sql / analyst_conclude）的成本与时延归因。
     #: 分级路由靠它决定哪些调用点值得切到 fast 档。
     route_tokens: dict[str, dict[str, int]] = field(default_factory=dict)
+    #: 检索阶段实际取到的知识文档与片段数——RAG 回归的结构性证据
+    retrieved_docs: list[str] = field(default_factory=list)
+    knowledge_count: int = 0
 
 
 def _analyst_outputs(outcome) -> dict:
@@ -82,6 +85,18 @@ def _analyst_outputs(outcome) -> dict:
         if res.get("node_id") == "analyst_1":
             return res.get("outputs", {}) or {}
     return {}
+
+
+def _retriever_outputs(outcome) -> dict:
+    for res in outcome.node_results:
+        if res.get("node_id") == "retriever_1":
+            return res.get("outputs", {}) or {}
+    return {}
+
+
+def _retrieved_docs(outcome) -> list[str]:
+    knowledge = _retriever_outputs(outcome).get("knowledge", []) or []
+    return [str(item.get("doc_id", "")) for item in knowledge]
 
 
 def grade(case: EvalCase, outcome) -> tuple[bool, list[str], list[str], bool]:
@@ -108,6 +123,15 @@ def grade(case: EvalCase, outcome) -> tuple[bool, list[str], list[str], bool]:
         for group in case.expect_any:
             if not any(_matches(text, alt) for alt in group):
                 failed.append("|".join(group))
+
+    # RAG 回归：知识必须**真的被检索到**。
+    # 只检查答案文本无法区分「模型本来就知道」与「查了知识库」，
+    # 因此这里查的是检索结果这一结构性证据。
+    docs = _retrieved_docs(outcome)
+    if case.require_knowledge and not docs:
+        failed.append("未检索到任何知识")
+    if case.expect_docs and not any(exp in doc for exp in case.expect_docs for doc in docs):
+        failed.append("知识库:" + "|".join(case.expect_docs))
 
     hit_forbidden = [w for w in case.forbid if _matches(text, w)]
     return (not failed and not hit_forbidden), failed, hit_forbidden, insufficient
@@ -228,6 +252,7 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
 
         passed, failed, forbidden, insufficient = grade(case, outcome)
         outputs = _analyst_outputs(outcome)
+        docs = _retrieved_docs(outcome)
         report.results.append(
             CaseResult(
                 case_id=case.id,
@@ -246,6 +271,8 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
                 summary=(outcome.summary or "")[:200],
                 error=outcome.error,
                 route_tokens=outcome.tokens_by_route,
+                retrieved_docs=sorted(set(docs)),
+                knowledge_count=len(docs),
             )
         )
         if passed:
@@ -320,8 +347,8 @@ def render_markdown(report: EvalReport) -> str:
 
     add("## 逐条结果")
     add("")
-    add("| # | 用例 | 结果 | 时延 | Token | SQL 行数 | 未命中 |")
-    add("| :-- | :--- | :-- | --: | --: | --: | :--- |")
+    add("| # | 用例 | 结果 | 时延 | Token | 知识 | SQL 行数 | 未命中 |")
+    add("| :-- | :--- | :-- | --: | --: | --: | --: | :--- |")
     for i, r in enumerate(report.results, start=1):
         mark = "✅" if r.passed else "❌"
         detail = r.error or (", ".join(r.failed_checks) if r.failed_checks else "")
@@ -329,7 +356,8 @@ def render_markdown(report: EvalReport) -> str:
             detail = f"命中禁用词 {r.hit_forbidden}"
         add(
             f"| {i} | `{r.case_id}` | {mark} | {r.latency_ms / 1000:.1f}s | "
-            f"{r.tokens:,} | {r.sql_rows if r.sql_rows is not None else '-'} | {detail} |"
+            f"{r.tokens:,} | {r.knowledge_count or '-'} | "
+            f"{r.sql_rows if r.sql_rows is not None else '-'} | {detail} |"
         )
     add("")
 
@@ -369,6 +397,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"忽略未知用例 id: {unknown}")
 
     print(f"▶ 评测 {len(cases)} 条用例，模型 {settings.primary.provider}/{settings.primary.model}\n")
+
+    # RAG 用例依赖知识库；先确认它非空，否则这些用例会以难懂的方式失败
+    knowledge_cases = [c for c in cases if c.expect_docs or c.require_knowledge]
+    if knowledge_cases:
+        from ..rag import KnowledgeStore
+
+        try:
+            stats = KnowledgeStore(settings).stats()
+        except Exception as exc:
+            print(f"⚠ 无法确认知识库状态（{exc}）——本轮 {len(knowledge_cases)} 条 RAG 用例可能全部失败\n")
+        else:
+            if stats["chunks"] == 0:
+                print(
+                    f"⚠ 知识库为空，但本轮有 {len(knowledge_cases)} 条用例依赖它。"
+                    "请先执行：python -m multiagent.rag.ingest\n"
+                )
+            else:
+                print(
+                    f"知识库就绪：{stats['documents']} 篇 / {stats['chunks']} 分块"
+                    f"（{len(knowledge_cases)} 条用例依赖它）\n"
+                )
+
     report = run_cases_sync(settings, cases)
 
     markdown = render_markdown(report)

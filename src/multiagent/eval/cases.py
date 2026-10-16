@@ -25,6 +25,12 @@ class EvalCase:
     expect_any: list[list[str]] = field(default_factory=list)
     forbid: list[str] = field(default_factory=list)
     expect_insufficient: bool = False
+    #: 期望被检索到的知识库文档（doc_id 子串，命中**任意一个**即可）。
+    #: 这是「知识库确实参与了这个问题的回答」的**结构性证据**——
+    #: 只检查答案文本无法区分「模型本来就知道」与「真的查了知识库」。
+    expect_docs: list[str] = field(default_factory=list)
+    #: 是否强制要求检索阶段取到了知识（用于纯知识类问题）
+    require_knowledge: bool = False
     note: str = ""
 
 
@@ -162,6 +168,50 @@ CASES: list[EvalCase] = [
         expect_any=[["没有", "无数据", "缺失", "不存在", "查不到", "未找到", "未覆盖", "0 行"]],
         expect_insufficient=True,
         note="关键诚实性用例：数据里根本没有华北区，必须承认而不是编造",
+    ),
+    # ---------------------- 知识库依赖用例（RAG 回归） ----------------------
+    # 共同设计原则：**SQL 单独答不出来**。
+    # 若哪天 RAG 被改坏（检索退化、知识没进提示词、灌库丢失），这些用例会直接失败——
+    # 这是它们存在的唯一理由，也是「没有回归用例的能力等于没有能力」的落实。
+    EvalCase(
+        id="rag_refund_is_policy_not_quality",
+        question="华东区9月线上退货率大幅上升，是不是产品质量出了问题？",
+        expect_any=[
+            # 只有读了政策文档才写得出这些词
+            ["政策", "口径", "全量质检", "免运费"],
+            # 关键结论：不能据此判定质量恶化
+            ["非质量", "不代表", "并非", "不是质量", "不能说明", "不是产品", "口径变化", "政策调整"],
+        ],
+        expect_docs=["return-policy"],
+        note="核心 RAG 用例：数据只显示退货率上升，能否解释成「口径变化而非质量恶化」完全依赖知识库",
+    ),
+    EvalCase(
+        id="rag_region_definition",
+        question="华东区具体包含哪些省市？",
+        expect_any=[["江苏"], ["浙江"], ["山东", "安徽", "福建", "江西"]],
+        expect_docs=["region-definition"],
+        require_knowledge=True,
+        note="纯知识问题：SQL 里只有「华东」两个字，省市清单只存在于知识库",
+    ),
+    EvalCase(
+        id="rag_daily_volatility_infeasible",
+        question="帮我算一下华东区9月的日波动率",
+        expect_any=[
+            ["月度", "月初", "快照", "月粒度"],
+            ["无法", "不能", "做不到", "缺少", "没有日", "不足以"],
+        ],
+        expect_docs=["sales-data-dictionary", "region-definition"],
+        note="可行性判断依赖数据字典：数据是月度快照，日粒度指标算不出来",
+    ),
+    EvalCase(
+        id="rag_sep_promo_anomaly",
+        question="9 月是线上大促月，华东区线上数码 9 月却不升反降，这说明了什么？",
+        expect_any=[
+            ["异常", "反常", "不正常", "值得关注", "信号", "背离"],
+            ["37.6", "下降", "下滑", "减少"],
+        ],
+        expect_docs=["channel-ops", "q2-2026-review", "return-policy"],
+        note="需要运营日历知识：9 月本是线上数码高峰，不升反降属异常信号",
     ),
 ]
 

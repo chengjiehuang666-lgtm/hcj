@@ -25,10 +25,15 @@ class FakeOutcome:
         findings: list[str] | None = None,
         insufficient: bool = False,
         row_count: int | None = 3,
+        knowledge: list[dict] | None = None,
     ) -> None:
         self.status = status
         self.summary = summary
         self.node_results = [
+            {
+                "node_id": "retriever_1",
+                "outputs": {"knowledge": knowledge or []},
+            },
             {
                 "node_id": "analyst_1",
                 "outputs": {
@@ -36,7 +41,7 @@ class FakeOutcome:
                     "insufficient_data": insufficient,
                     "row_count": row_count,
                 },
-            }
+            },
         ]
 
 
@@ -134,3 +139,59 @@ def test_case_set_is_well_formed() -> None:
     assert all(c.expect_any or c.forbid or c.expect_insufficient for c in CASES), (
         "每条用例都要有可判定的期望，否则无法自动打分"
     )
+
+
+# ------------------------------------------------- 知识库依赖用例（RAG 回归）
+
+
+def test_rag_cases_exist_and_are_structural() -> None:
+    """RAG 能力必须有回归用例，否则会在后续改动中被无声改坏。"""
+    from multiagent.eval.cases import CASES
+
+    rag_cases = [c for c in CASES if c.expect_docs or c.require_knowledge]
+    assert len(rag_cases) >= 4, f"知识库依赖用例应至少 4 条，当前 {len(rag_cases)}"
+    assert any("refund" in c.id for c in rag_cases), "应包含退货率那条核心用例"
+    # 每条 RAG 用例都必须同时检查「检索到了什么」与「答案说了什么」
+    assert all(c.expect_any and c.expect_docs for c in rag_cases), (
+        "RAG 用例既要检查检索结果，也要检查答案内容"
+    )
+
+
+def test_expected_doc_retrieved_passes() -> None:
+    case = EvalCase(id="c", question="q", expect_docs=["return-policy"])
+    outcome = FakeOutcome(knowledge=[{"doc_id": "return-policy-2026h2"}])
+    passed, failed, _, _ = grade(case, outcome)
+    assert passed, failed
+
+
+def test_expected_doc_missing_fails_even_if_answer_looks_right() -> None:
+    """答案看起来对，但知识库没被检索到 —— 必须判失败。
+
+    这正是「只检查答案文本无法区分模型本来就知道与真的查了知识库」的落点。
+    """
+    case = EvalCase(id="c", question="q", expect_docs=["return-policy"])
+    outcome = FakeOutcome(summary="这是政策口径变化导致的", knowledge=[{"doc_id": "other-doc"}])
+    passed, failed, _, _ = grade(case, outcome)
+    assert not passed
+    assert any("知识库" in f for f in failed), failed
+
+
+def test_require_knowledge_fails_when_nothing_retrieved() -> None:
+    case = EvalCase(id="c", question="q", require_knowledge=True)
+    passed, failed, _, _ = grade(case, FakeOutcome(knowledge=[]))
+    assert not passed
+    assert "未检索到任何知识" in failed
+
+
+def test_doc_matching_is_substring_based() -> None:
+    case = EvalCase(id="c", question="q", expect_docs=["channel-ops"])
+    outcome = FakeOutcome(knowledge=[{"doc_id": "channel-ops-calendar"}])
+    passed, failed, _, _ = grade(case, outcome)
+    assert passed, failed
+
+
+def test_multiple_expected_docs_accept_any_match() -> None:
+    case = EvalCase(id="c", question="q", expect_docs=["sales-data-dictionary", "region-definition"])
+    outcome = FakeOutcome(knowledge=[{"doc_id": "region-definition"}])
+    passed, failed, _, _ = grade(case, outcome)
+    assert passed, failed
