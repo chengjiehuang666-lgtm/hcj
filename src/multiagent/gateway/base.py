@@ -26,6 +26,11 @@ class LLMMessage:
     def user(content: str) -> LLMMessage:
         return LLMMessage(MessageRole.user, content)
 
+    @staticmethod
+    def assistant(content: str) -> LLMMessage:
+        """用于把模型的上一轮输出回灌给它（结构化输出的纠错重试需要）。"""
+        return LLMMessage(MessageRole.assistant, content)
+
 
 @dataclass(frozen=True, slots=True)
 class LLMResponse:

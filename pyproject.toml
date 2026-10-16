@@ -16,9 +16,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# 编排内核，阶段一 W2 才需要（LangGraph）
+# 编排内核，阶段一 W2 起需要（LangGraph + 图状态持久化到 PostgreSQL）
 agents = [
-    "langgraph>=0.2",
+    "langgraph>=1.0",
+    "langgraph-checkpoint-postgres>=3.0",
 ]
 dev = [
     "pytest>=8.0",

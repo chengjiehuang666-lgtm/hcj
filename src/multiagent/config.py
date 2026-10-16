@@ -50,13 +50,27 @@ class Settings(BaseSettings):
 
     # ---- 基础设施（与 docker-compose.yml 默认值一致）----
     postgres_dsn: str = "postgresql://multiagent:multiagent@localhost:5432/multiagent"
+    # SQL 沙箱专用：只读角色，Agent 执行查询一律用它，不用上面的应用主账号。
+    # 该角色的权限由 docker/initdb/02-demo-data.sql 授予（仅 SELECT + 5s 语句超时）。
+    postgres_ro_dsn: str = "postgresql://analyst_ro:analyst_ro@localhost:5432/multiagent"
     redis_url: str = "redis://localhost:6379/0"
+
+    # ---- SQL 沙箱约束 ----
+    sql_max_rows: int = 500
+    sql_timeout_seconds: int = 10
 
     # ---- 执行预算默认值（对应契约 TaskEvent.budget）----
     default_max_steps: int = 30
     default_max_tokens: int = 200_000  # 待评测集校准，见《实施路线图》待定项 D2
     default_max_retries: int = 2
     default_task_timeout_seconds: int = 300
+
+    # 单次模型调用的输出上限。
+    # max_tokens 只是上限、不用不收费，所以给足以免被截断；
+    # 真正的成本控制由上面的任务级 default_max_tokens 熔断负责。
+    # 实测：推理型模型（deepseek-flash）在「生成结构化 DAG」这类重推理任务上
+    # 需 ~2400 输出 token（其中思考 ~2100），4096 会因思考吃满而截断成空内容。
+    llm_max_output_tokens: int = 8192
 
     # ---- 派生配置 ----
     @property
