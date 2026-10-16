@@ -1,16 +1,25 @@
-"""LangGraph 串行链路：Planner → Retriever → Analyst。
+"""编排层：由 SubtaskDAG 在运行时驱动的动态图执行。
 
-W2 的出口标准（见《实施路线图》）：
-- 基于 LangGraph 实现三个 Agent 的串行链路
-- 任务状态 Checkpoint 落 PostgreSQL，支持断点续跑
+**W5 的核心变化**：链路不再写死，而是由 Planner 产出的 DAG 决定图结构：
+节点 = DAG 节点，边 = depends_on，同一层互不依赖的节点由 LangGraph 在同一个
+superstep 内**并发执行**。引擎是通用的（能跑任意合法 DAG），"产出什么形状"是
+Planner 的策略，两者分开——引擎的通用性由 `tests/test_pipeline_engine.py` 用多种
+合成 DAG 证明。
 
-设计说明：
-- **状态外置**：图的运行态由 LangGraph 的 PostgresSaver 持久化，进程重启后
-  凭 thread_id（即 task_id）即可续跑，这是 Product 需求里「会话断点续接」的基础。
-- **黑板**：节点之间不互相传私有状态，产物统一写入 state 里的 blackboard，
-  与《产品需求》1.3「单一事实源」约定一致。
-- **失败即中止**：任一节点返回 status=failed 就抛 PipelineNodeFailed 终止本次
-  运行。重试、降级与动态重规划属于 W7 范畴。
+**为什么 Planner 在 graph 之外先跑**：图结构依赖它的输出，无法装进同一个图；
+契约本身也写明「Planner 是产出者而非节点」（`contracts/subtask_dag.py` 的
+`AgentRole` 注释）。
+
+**三个并发相关的硬约束**（W5 改造时必须同时解决，否则并行节点会互相破坏）：
+
+1. `node_outputs` / `blackboard` / `node_results` 必须带 reducer。
+   无 reducer 的字段是 `LastValue` channel，同一步内被两个节点写入会直接抛
+   `InvalidUpdateError`（`langgraph/channels/last_value.py`）。
+2. 节点函数只能返回**本节点的增量**，不能读旧状态再全量写回——并行时那会丢更新
+   （各自的读都基于步初快照）。
+3. 状态里不再有按 role 硬编码的扁平字段（`schema`/`knowledge`/`summary`…）。
+   那套分发是「role 三选一」，新角色的输出会被静默丢弃。现在统一进
+   `node_outputs`（node_id → outputs），下游按 `depends_on` 取用。
 """
 
 from __future__ import annotations
@@ -19,17 +28,19 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from ..agents import AgentContext, AnalystAgent, PlannerAgent, RetrieverAgent
+from ..agents import AgentContext, BaseAgent, build_agent_registry
 from ..config import Settings
 from ..contracts import (
     AgentInvocation,
     AgentResult,
     InvocationBudget,
     ResultStatus,
+    SubtaskDAG,
+    SubtaskNode,
     TaskEvent,
     to_wire,
 )
@@ -39,20 +50,42 @@ from ..tools import SqlSandbox
 # 业务时区（东八区）。平台面向国内业务，统一用它，避免「上月」算错月份。
 TZ_CN = timezone(timedelta(hours=8))
 
+#: Planner 不在 DAG 内（它是图的产出者），但仍要进 node_results/黑板供观测与追溯。
+PLANNER_NODE_ID = "planner_1"
+
+
+# ---------------------------------------------------------------- state reducer
+
+
+def _merge_dicts(left: dict | None, right: dict | None) -> dict:
+    """字典归并：右侧覆盖同名键。用于并行节点写同一状态字段时的合并。"""
+    return {**(left or {}), **(right or {})}
+
+
+def _concat_lists(left: list | None, right: list | None) -> list:
+    """列表拼接。用于 node_results 这类「只追加」的字段。"""
+    return [*(left or []), *(right or [])]
+
 
 class PipelineState(TypedDict, total=False):
-    """图状态。字段尽量保持可 JSON 序列化，以便 Checkpoint 落库。"""
+    """图状态。字段尽量保持可 JSON 序列化，以便 Checkpoint 落库。
 
+    ⚠️ 三个带 reducer 的字段是**并行安全的必要条件**，不要去掉 reducer
+    （原因见模块 docstring）。
+    """
+
+    # ---- 单次运行的静态上下文：只有入口写入，无并发冲突 ----
     task_event: dict[str, Any]
     now: str
-    schema: str
-    data_ranges: str
-    metric_definitions: dict[str, Any]
-    knowledge: list[dict[str, Any]]
     dag: dict[str, Any]
-    blackboard: dict[str, Any]
-    node_results: list[dict[str, Any]]
-    summary: str
+
+    # ---- 并发写入的三件套：必须带 reducer ----
+    #: node_id -> 该节点的 outputs。下游据此取上游产物。
+    node_outputs: Annotated[dict[str, dict[str, Any]], _merge_dicts]
+    #: 黑板：key（`<node_id>.<output>`）-> 条目
+    blackboard: Annotated[dict[str, Any], _merge_dicts]
+    #: 逐节点结果（按完成顺序追加，只增不改）
+    node_results: Annotated[list[dict[str, Any]], _concat_lists]
 
 
 class PipelineNodeFailed(Exception):
@@ -66,12 +99,18 @@ class PipelineNodeFailed(Exception):
         super().__init__(f"节点 {node_id} 失败 [{code}]: {message}")
 
 
+class PipelinePlanError(Exception):
+    """Planner 产出的 DAG 无法执行（引用了未注册的角色等）。"""
+
+
 @dataclass
 class PipelineOutcome:
     task_id: str
     status: str  # ok | failed
     blackboard: dict[str, Any] = field(default_factory=dict)
     node_results: list[dict[str, Any]] = field(default_factory=list)
+    #: node_id -> outputs。下游取值请走这里或 `outputs_for_role`，不要按固定 node_id 找。
+    node_outputs: dict[str, dict[str, Any]] = field(default_factory=dict)
     summary: str = ""
     dag: dict[str, Any] = field(default_factory=dict)
     total_tokens: int = 0
@@ -80,6 +119,33 @@ class PipelineOutcome:
     #: 逐次模型调用明细（按发生顺序）。供分级路由的成本/时延归因与 W10 成本计量使用。
     #: 注意：这是**内部结构**，不属于任何已冻结的契约。
     call_records: list[dict[str, Any]] = field(default_factory=list)
+
+    def outputs_for_role(self, role: str) -> list[dict[str, Any]]:
+        """按 agent_role 取该角色所有节点的 outputs（按发生顺序，结果稳定）。
+
+        动态 DAG 下节点 ID 是运行时可变的，**按 role 取值才是稳定的**；
+        评测/接口/CLI 都走这个入口，而不是按固定 node_id 去找。
+        """
+        return [
+            res.get("outputs") or {}
+            for res in self.node_results
+            if res.get("agent_role") == role
+        ]
+
+    def merged_outputs_for_role(self, role: str) -> dict[str, Any]:
+        """按 role 合并该角色所有节点的 outputs（后者覆盖同名键）。
+
+        单节点角色（如 analyst）等价于取该节点 outputs；多节点角色（如两路
+        retriever）则是把两路合并——正是下游需要的形态。
+        """
+        merged: dict[str, Any] = {}
+        for outputs in self.outputs_for_role(role):
+            merged.update(outputs)
+        return merged
+
+    def first_output_for_role(self, role: str) -> dict[str, Any]:
+        found = self.outputs_for_role(role)
+        return found[0] if found else {}
 
     @property
     def tokens_by_route(self) -> dict[str, dict[str, int]]:
@@ -113,8 +179,25 @@ class PipelineOutcome:
         return sum(r.get("tokens_used", {}).get("output", 0) for r in self.node_results)
 
 
+def sink_node_ids(dag: dict[str, Any]) -> list[str]:
+    """汇点：没有被任何其它节点依赖的节点。取最终结论就看它们。"""
+    if not isinstance(dag, dict):
+        # 契约里 dag 是对象；这里显式报错而不是让 "str has no attribute get" 这种
+        # 信息量极低的异常冒出去（曾因此排查了一轮间歇性崩溃）
+        raise TypeError(f"dag 期望是对象，实际是 {type(dag).__name__}: {dag!r:.120}")
+    nodes = dag.get("nodes", [])
+    depended_on: set[str] = set()
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise TypeError(
+                f"dag.nodes 的每个元素都应是对象，遇到 {type(node).__name__}: {node!r:.120}"
+            )
+        depended_on.update(node.get("depends_on", []) or [])
+    return [n["node_id"] for n in nodes if n["node_id"] not in depended_on]
+
+
 class AnalysisPipeline:
-    """把用户需求跑成分析报告的串行链路。
+    """按 Planner 产出的 DAG 执行分析任务。
 
     `on_event` 是可选的事件回调（async），用于向外部（如 SSE 接口）推送节点级进度。
     **事件通道故障不得影响主流程**，故回调异常一律吞掉——进度是观测手段，
@@ -157,8 +240,35 @@ class AnalysisPipeline:
         )
 
     @staticmethod
-    def _absorb(state: PipelineState, inv: AgentInvocation, result: AgentResult) -> dict:
-        """把节点结果合并进状态；失败则中止。"""
+    def _build_node_input(node: SubtaskNode, state: PipelineState) -> dict[str, Any]:
+        """组装节点输入：问题 + **直接上游**产物（按 key 合并）+ 该节点的声明。
+
+        采用「上游产物按 key 合并」而不是让 Planner 写死数据流接线，是为了让
+        Planner 只关心「做什么」，不必关心「数据怎么传」。上游 key 互不重叠时
+        合并是安全的；即便重叠，黑板里的 `<node_id>.<output>` 仍保留完整出处。
+        """
+        merged: dict[str, Any] = {}
+        for dep in node.depends_on:
+            merged.update(state.get("node_outputs", {}).get(dep, {}))
+
+        return {
+            **merged,
+            **(node.inputs or {}),
+            # 保留键放在最后，保证不被上游产物或节点声明覆盖
+            "question": state["task_event"]["payload"]["text"],
+            "now": state.get("now", ""),
+            "acceptance": list(node.acceptance),
+            "node_id": node.node_id,
+            "upstream_nodes": list(node.depends_on),
+        }
+
+    @staticmethod
+    def _absorb(inv: AgentInvocation, result: AgentResult, agent: BaseAgent) -> dict:
+        """把节点结果转成**状态增量**；失败则中止。
+
+        只返回本节点的增量（不读旧状态、不做全量覆盖），这样 reducer 才能安全
+        合并并行节点的写入。
+        """
         if result.status is not ResultStatus.ok:
             err = result.error
             raise PipelineNodeFailed(
@@ -168,129 +278,85 @@ class AnalysisPipeline:
                 retryable=err.retryable if err else False,
             )
 
-        wire = to_wire(result)
-        blackboard = dict(state.get("blackboard", {}))
-        for key in result.blackboard_writes:
-            payload = result.outputs
-            blackboard[key] = {
-                "version": 1,
-                "written_by": f"{inv.agent_role}@0.1.0",
-                "confidence": result.confidence,
-                "payload": payload,
-                "sources": wire.get("sources", []),
-            }
-
-        merge: dict[str, Any] = {
-            "blackboard": blackboard,
-            "node_results": [*state.get("node_results", []), wire],
+        wire = {
+            **to_wire(result),
+            # 把角色写进 node_results：下游（评测/接口/CLI）按 role 取值即可，
+            # 不必依赖运行时可变的 node_id。node_results 是内部结构，可自由扩展。
+            "agent_role": inv.agent_role,
         }
-        if inv.agent_role == "planner":
-            merge["dag"] = result.outputs.get("dag", {})
-        elif inv.agent_role == "retriever":
-            merge["schema"] = result.outputs.get("schema", "")
-            merge["metric_definitions"] = result.outputs.get("metric_definitions", {})
-            merge["data_ranges"] = result.outputs.get("data_ranges", "")
-            merge["knowledge"] = result.outputs.get("knowledge", [])
-        elif inv.agent_role == "analyst":
-            merge["summary"] = result.outputs.get("summary", "")
-        return merge
+        entry = {
+            "version": 1,
+            "written_by": agent.labeled_version,  # 用真实 Agent 版本，不再写死
+            "confidence": result.confidence,
+            "payload": result.outputs,
+            "sources": wire.get("sources", []),
+        }
+        return {
+            "node_outputs": {inv.node_id: result.outputs},
+            "blackboard": {key: entry for key in result.blackboard_writes},
+            "node_results": [wire],
+        }
 
-    def _build(self, ctx: AgentContext):
-        planner, retriever, analyst = PlannerAgent(), RetrieverAgent(), AnalystAgent()
+    def _make_node_fn(self, ctx: AgentContext, node: SubtaskNode):
+        """为一个 DAG 节点生成 LangGraph 节点函数。"""
 
-        async def plan_node(state: PipelineState) -> dict:
+        async def run_node(state: PipelineState) -> dict:
+            agent = ctx.registry.get(node.agent_role.value)
+            if agent is None:  # 建图时已校验，这里只是兜底
+                raise PipelinePlanError(
+                    f"节点 {node.node_id} 的角色 {node.agent_role.value!r} 未注册"
+                )
             task_id = state["task_event"]["task_id"]
-            question = state["task_event"]["payload"]["text"]
-            await self._emit("node_started", node_id="planner_1", agent_role="planner")
-            schema = ctx.sandbox.schema_as_prompt_text()
+            await self._emit(
+                "node_started", node_id=node.node_id, agent_role=node.agent_role.value
+            )
             inv = self._make_invocation(
-                "planner_1",
-                "planner",
-                {"question": question, "schema": schema, "now": state["now"]},
+                node.node_id,
+                node.agent_role.value,
+                self._build_node_input(node, state),
                 task_id=task_id,
             )
-            result = await planner.invoke(inv, ctx)
-            merged = self._absorb(state, inv, result)
+            result = await agent.invoke(inv, ctx)
+            delta = self._absorb(inv, result, agent)
             await self._emit(
                 "node_finished",
-                node_id="planner_1",
-                agent_role="planner",
-                status=result.status.value,
-                duration_ms=result.duration_ms,
-                tokens=result.tokens_used.total,
-            )
-            return merged
-
-        async def retrieve_node(state: PipelineState) -> dict:
-            task_id = state["task_event"]["task_id"]
-            question = state["task_event"]["payload"]["text"]
-            await self._emit("node_started", node_id="retriever_1", agent_role="retriever")
-            inv = self._make_invocation(
-                "retriever_1",
-                "retriever",
-                {"question": question, "dag": state.get("dag", {})},
-                task_id=task_id,
-            )
-            result = await retriever.invoke(inv, ctx)
-            merged = self._absorb(state, inv, result)
-            await self._emit(
-                "node_finished",
-                node_id="retriever_1",
-                agent_role="retriever",
+                node_id=node.node_id,
+                agent_role=node.agent_role.value,
                 status=result.status.value,
                 duration_ms=result.duration_ms,
                 tokens=result.tokens_used.total,
                 knowledge_count=result.outputs.get("knowledge_count", 0),
             )
-            return merged
+            return delta
 
-        async def analyze_node(state: PipelineState) -> dict:
-            task_id = state["task_event"]["task_id"]
-            question = state["task_event"]["payload"]["text"]
-            await self._emit("node_started", node_id="analyst_1", agent_role="analyst")
-            # 把 Planner 为该节点写的验收标准传给取数环节：
-            # 否则「写 SQL 的一步」不知道「下结论的一步」需要哪些维度和基期数据。
-            acceptance = [
-                criterion
-                for node in (state.get("dag") or {}).get("nodes", [])
-                if node.get("node_id") == "analyst_1"
-                for criterion in node.get("acceptance", [])
-            ]
-            inv = self._make_invocation(
-                "analyst_1",
-                "analyst",
-                {
-                    "question": question,
-                    "schema": state.get("schema", ""),
-                    "data_ranges": state.get("data_ranges", ""),
-                    "metric_definitions": state.get("metric_definitions", {}),
-                    "knowledge": state.get("knowledge", []),
-                    "now": state["now"],
-                    "acceptance": acceptance,
-                },
-                task_id=task_id,
+        return run_node
+
+    def _build_from_dag(self, ctx: AgentContext, dag: SubtaskDAG):
+        """按 DAG 构图：节点 = DAG 节点，边 = depends_on。
+
+        同一层互不依赖的节点没有互相的入边，LangGraph 会在同一个 superstep 内
+        并发执行它们——这正是动态 DAG 引擎要的东西。
+        """
+        unknown = [
+            n.node_id for n in dag.nodes if n.agent_role.value not in ctx.registry
+        ]
+        if unknown:
+            raise PipelinePlanError(
+                f"DAG 含未注册角色的节点 {unknown}；已注册角色: {sorted(ctx.registry)}。"
+                "请在 agents/build_agent_registry() 中登记后再让 Planner 规划。"
             )
-            result = await analyst.invoke(inv, ctx)
-            merged = self._absorb(state, inv, result)
-            await self._emit(
-                "node_finished",
-                node_id="analyst_1",
-                agent_role="analyst",
-                status=result.status.value,
-                duration_ms=result.duration_ms,
-                tokens=result.tokens_used.total,
-                sql_attempts=result.outputs.get("sql_attempts"),
-            )
-            return merged
 
         builder = StateGraph(PipelineState)
-        builder.add_node("plan", plan_node)
-        builder.add_node("retrieve", retrieve_node)
-        builder.add_node("analyze", analyze_node)
-        builder.add_edge(START, "plan")
-        builder.add_edge("plan", "retrieve")
-        builder.add_edge("retrieve", "analyze")
-        builder.add_edge("analyze", END)
+        for node in dag.nodes:
+            builder.add_node(node.node_id, self._make_node_fn(ctx, node))
+        for node in dag.nodes:
+            if node.depends_on:
+                for dep in node.depends_on:
+                    builder.add_edge(dep, node.node_id)
+            else:
+                builder.add_edge(START, node.node_id)
+        for sink in sink_node_ids(dag.model_dump(mode="json")):
+            builder.add_edge(sink, END)
         return builder
 
     # -------------------------------------------------------------------- 执行
@@ -304,19 +370,14 @@ class AnalysisPipeline:
         task_id = str(event.task_id)
         # 用路由器而非单条主备链：按调用点分派到不同档位（分级路由）
         router = build_router_from_settings(self.settings)
+        registry = build_agent_registry()
         ctx = AgentContext(
             settings=self.settings,
             gateway=router,
             sandbox=SqlSandbox(self.settings),
+            registry=registry,
         )
-        graph = self._build(ctx)
-
-        initial: PipelineState = {
-            "task_event": to_wire(event),
-            "now": datetime.now(TZ_CN).isoformat(timespec="seconds"),
-            "blackboard": {},
-            "node_results": [],
-        }
+        config = {"configurable": {"thread_id": task_id}}
 
         pool = AsyncConnectionPool(
             conninfo=self.settings.postgres_dsn,
@@ -328,11 +389,25 @@ class AnalysisPipeline:
         try:
             saver = AsyncPostgresSaver(pool)
             await saver.setup()
-            app = graph.compile(checkpointer=saver)
-            config = {"configurable": {"thread_id": task_id}}
-            # resume=True 时不传初值，由 Checkpoint 恢复上次中断的状态
-            payload = None if resume else initial
-            final = await app.ainvoke(payload, config=config)
+
+            # ---- Planner 先跑（图外的产出者）+ 构图 ----
+            if resume:
+                # 续跑时图结构必须与首次一致，否则与 checkpoint 的语义未定义。
+                # 因此从 checkpoint 里取回原 DAG，而不是重新规划。
+                snapshot = await saver.aget(config)
+                if snapshot is None:
+                    raise PipelineNodeFailed(
+                        PLANNER_NODE_ID, "NO_CHECKPOINT", f"线程 {task_id} 无 checkpoint，无法续跑", False
+                    )
+                dag = SubtaskDAG.model_validate(
+                    snapshot.checkpoint["channel_values"]["dag"]
+                )
+                initial: PipelineState | None = None  # None = 由 checkpoint 恢复状态
+            else:
+                dag, initial = await self._plan(ctx, event, task_id)
+
+            graph = self._build_from_dag(ctx, dag).compile(checkpointer=saver)
+            final = await graph.ainvoke(initial, config=config)
         except PipelineNodeFailed as exc:
             return PipelineOutcome(
                 task_id=task_id,
@@ -341,17 +416,27 @@ class AnalysisPipeline:
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 call_records=_serialize_call_records(router),
             )
+        except PipelinePlanError as exc:
+            return PipelineOutcome(
+                task_id=task_id,
+                status="failed",
+                error=f"[PLAN_INVALID] {exc}",
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                call_records=_serialize_call_records(router),
+            )
         finally:
             await pool.close()
 
         duration_ms = int((time.perf_counter() - started) * 1000)
         node_results = final.get("node_results", [])
+        node_outputs = final.get("node_outputs", {})
         outcome = PipelineOutcome(
             task_id=task_id,
             status="ok",
             blackboard=final.get("blackboard", {}),
             node_results=node_results,
-            summary=final.get("summary", ""),
+            node_outputs=node_outputs,
+            summary=_sink_summary(final.get("dag", {}), node_outputs),
             dag=final.get("dag", {}),
             total_tokens=sum(r.get("tokens_used", {}).get("total", 0) for r in node_results),
             duration_ms=duration_ms,
@@ -361,6 +446,74 @@ class AnalysisPipeline:
             # 路由表漏配不是致命错误（会退回默认档），但必须能被发现
             outcome.error = f"路由表未配置的调用点: {sorted(unmapped)}"
         return outcome
+
+    async def _plan(
+        self, ctx: AgentContext, event: TaskEvent, task_id: str
+    ) -> tuple[SubtaskDAG, PipelineState]:
+        """图外先跑 Planner，返回校验过的 DAG 与图执行的初始状态。"""
+        planner = ctx.registry.get("planner")
+        if planner is None:
+            raise PipelinePlanError("注册表中缺少 planner，无法规划任务图")
+
+        await self._emit("node_started", node_id=PLANNER_NODE_ID, agent_role="planner")
+        inv = self._make_invocation(
+            PLANNER_NODE_ID,
+            "planner",
+            {
+                "question": event.payload.text,
+                "schema": ctx.sandbox.schema_as_prompt_text(),
+                "now": datetime.now(TZ_CN).isoformat(timespec="seconds"),
+                # 让 Planner 知道哪些角色真的可执行，避免规划出跑不了的节点
+                "available_roles": sorted(
+                    role for role in ctx.registry if role != "planner"
+                ),
+            },
+            task_id=task_id,
+        )
+        result = await planner.invoke(inv, ctx)
+        delta = self._absorb(inv, result, planner)  # 失败会抛 PipelineNodeFailed
+        await self._emit(
+            "node_finished",
+            node_id=PLANNER_NODE_ID,
+            agent_role="planner",
+            status=result.status.value,
+            duration_ms=result.duration_ms,
+            tokens=result.tokens_used.total,
+        )
+
+        dag = SubtaskDAG.model_validate(result.outputs["dag"])
+        initial: PipelineState = {
+            "task_event": to_wire(event),
+            "now": datetime.now(TZ_CN).isoformat(timespec="seconds"),
+            "dag": result.outputs["dag"],
+            "node_outputs": delta["node_outputs"],
+            "blackboard": delta["blackboard"],
+            "node_results": delta["node_results"],
+        }
+        return dag, initial
+
+
+def _sink_summary(dag: dict[str, Any], node_outputs: dict[str, dict[str, Any]]) -> str:
+    """取最终结论：优先汇点节点的 summary，退化到任意节点的 summary。
+
+    动态 DAG 下不该把「谁产出结论」写死在某个 node_id 上。
+    """
+    for node_id in sink_node_ids(dag):
+        outputs = node_outputs.get(node_id)
+        if outputs is None:
+            continue
+        if not isinstance(outputs, dict):
+            raise TypeError(
+                f"节点 {node_id} 的 outputs 期望是对象，实际是 {type(outputs).__name__}；"
+                "AgentResult 契约要求 outputs 为 dict。"
+            )
+        if outputs.get("summary"):
+            return str(outputs["summary"])
+
+    for node_id, outputs in node_outputs.items():
+        if isinstance(outputs, dict) and outputs.get("summary"):
+            return str(outputs["summary"])
+    return ""
 
 
 def _serialize_call_records(router) -> list[dict[str, Any]]:

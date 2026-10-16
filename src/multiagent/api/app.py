@@ -52,10 +52,8 @@ def _default_pipeline_factory(settings: Settings, on_event) -> AnalysisPipeline:
 
 
 def _outcome_to_result(outcome: PipelineOutcome) -> dict[str, Any]:
-    analyst = next(
-        (r for r in outcome.node_results if r.get("node_id") == "analyst_1"), None
-    ) or {}
-    outputs = analyst.get("outputs", {}) if isinstance(analyst, dict) else {}
+    # 按 agent_role 取值：动态 DAG 下 node_id 可变，写死 "analyst_1" 会取不到
+    outputs = outcome.merged_outputs_for_role("analyst")
     return {
         "status": outcome.status,
         "summary": outcome.summary,
@@ -71,6 +69,7 @@ def _outcome_to_result(outcome: PipelineOutcome) -> dict[str, Any]:
         "nodes": [
             {
                 "node_id": r.get("node_id"),
+                "agent_role": r.get("agent_role"),
                 "status": r.get("status"),
                 "duration_ms": r.get("duration_ms"),
                 "tokens": (r.get("tokens_used") or {}).get("total"),

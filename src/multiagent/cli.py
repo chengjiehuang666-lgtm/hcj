@@ -60,11 +60,9 @@ def _print_outcome(outcome) -> int:
     print("\n【结论】")
     print(f"  {outcome.summary or '(无)'}")
 
-    analyst = next(
-        (r for r in outcome.node_results if r.get("node_id") == "analyst_1"), None
-    )
-    if analyst:
-        outputs = analyst.get("outputs", {})
+    analyst_results = [r for r in outcome.node_results if r.get("agent_role") == "analyst"]
+    if analyst_results:
+        outputs = outcome.merged_outputs_for_role("analyst")
         print("\n【关键发现】")
         for finding in outputs.get("key_findings", []):
             print(f"  · {finding}")

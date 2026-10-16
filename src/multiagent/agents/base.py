@@ -52,11 +52,16 @@ class AgentContext:
     `gateway` 既可以是 `LLMGateway`（单条主备链），也可以是 `ModelRouter`
     （分级路由）。两者具有完全相同的 `complete()` 签名，因此可互换；
     传 `ModelRouter` 时，调用方通过 `route` 指定调用点来选档位。
+
+    `registry` 是 role -> Agent 实例的映射（见 `build_agent_registry`），
+    编排层用它把 DAG 节点分派给对应 Agent，并校验 DAG 里的角色确实可执行。
     """
 
     settings: Settings
     gateway: LLMGateway | ModelRouter
     sandbox: SqlSandbox
+    #: role -> Agent 实例。留空时表示"不走注册表"（单测构造 ctx 时常见）
+    registry: dict[str, BaseAgent] = field(default_factory=dict)
 
 
 @dataclass

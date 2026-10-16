@@ -29,13 +29,16 @@ class FakeOutcome:
     ) -> None:
         self.status = status
         self.summary = summary
+        # agent_role 必须带上：打分器按 role 取值（动态 DAG 下 node_id 可变）
         self.node_results = [
             {
                 "node_id": "retriever_1",
+                "agent_role": "retriever",
                 "outputs": {"knowledge": knowledge or []},
             },
             {
                 "node_id": "analyst_1",
+                "agent_role": "analyst",
                 "outputs": {
                     "key_findings": findings or [],
                     "insufficient_data": insufficient,

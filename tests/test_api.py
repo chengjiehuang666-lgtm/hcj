@@ -39,10 +39,19 @@ class FakePipeline:
 
     async def run(self, event):
         if self._on_event:
-            for node_id in ("planner_1", "retriever_1", "analyst_1"):
-                await self._on_event("node_started", {"node_id": node_id})
+            # 与真实链路一致：planner 在图外先跑，DAG 有两个并行检索 + 一个分析
+            for node_id, role in (
+                ("planner_1", "planner"),
+                ("retriever_1", "retriever"),
+                ("retriever_2", "retriever"),
+                ("analyst_1", "analyst"),
+            ):
                 await self._on_event(
-                    "node_finished", {"node_id": node_id, "status": "ok", "tokens": 100}
+                    "node_started", {"node_id": node_id, "agent_role": role}
+                )
+                await self._on_event(
+                    "node_finished",
+                    {"node_id": node_id, "agent_role": role, "status": "ok", "tokens": 100},
                 )
         if self._should_fail:
             raise RuntimeError("模拟流水线崩溃")
@@ -55,6 +64,7 @@ class FakePipeline:
             node_results=[
                 {
                     "node_id": "analyst_1",
+                    "agent_role": "analyst",
                     "status": "ok",
                     "duration_ms": 1000,
                     "tokens_used": {"input": 100, "output": 221, "total": 321},
@@ -170,8 +180,10 @@ def test_events_stream_contains_node_progress_and_finish() -> None:
     assert "event: node_started" in payload
     assert "event: node_finished" in payload
     assert "event: task_finished" in payload
-    # 事件必须带 node_id，否则前端无法把进度挂到对应节点上
+    # 事件必须带 node_id 与 agent_role，否则前端无法把进度挂到节点上
     assert "planner_1" in payload and "analyst_1" in payload
+    assert "retriever_2" in payload, "并行检索的第二路也应出现在事件流里"
+    assert '"agent_role": "retriever"' in payload
 
 
 def test_streaming_after_completion_replays_buffered_events() -> None:
@@ -183,7 +195,8 @@ def test_streaming_after_completion_replays_buffered_events() -> None:
     with client.stream("GET", f"/tasks/{task_id}/events") as response:
         payload = "".join(response.iter_text())
 
-    assert payload.count("event: node_finished") == 3
+    # planner（图外）+ 两路并行检索 + 分析
+    assert payload.count("event: node_finished") == 4
     assert "task_finished" in payload
 
 

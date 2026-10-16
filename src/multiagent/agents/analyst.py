@@ -269,5 +269,7 @@ class AnalystAgent(BaseAgent):
             usage=usage,
             duration_ms=int((time.perf_counter() - started) * 1000),
             confidence=conclusion.confidence,
-            blackboard_writes=["analyst_1.report"],
+            # 黑板 key 由实际 node_id 派生：动态 DAG 下节点名是运行时可变的，
+            # 写死 "analyst_1.report" 会让多个 analyst 节点互相覆盖。
+            blackboard_writes=[f"{inv.node_id}.report"],
         )

@@ -74,7 +74,14 @@ def _node_invocation(node_id: str, role: str, **inputs) -> AgentInvocation:
         attempt=1,
         agent_role=role,
         trace_id="trace-1",
-        input={"question": "分析上月华东区销售额下滑原因", "schema": "- sales(...)", "now": "2026-10-16T12:00:00+08:00", **inputs},
+        input={
+            "question": "分析上月华东区销售额下滑原因",
+            "schema": "- sales(...)",
+            "now": "2026-10-16T12:00:00+08:00",
+            # Planner 必须知道哪些角色可执行，否则无从规划（W5 起的必要输入）
+            "available_roles": ["retriever", "analyst"],
+            **inputs,
+        },
         budget=InvocationBudget(max_tokens=8192, timeout_seconds=300),
     )
 
@@ -229,8 +236,9 @@ def test_classify_error_mapping(exc, expected_code, expected_retryable) -> None:
 
 
 def test_absorb_raises_on_failed_node_result() -> None:
-    pipeline = AnalysisPipeline(settings)
-    inv = _invocation()
+    from multiagent.agents import AnalystAgent
+
+    inv = _node_invocation("analyst_1", "analyst")
     failed = AgentResult(
         task_id=inv.task_id,
         node_id="analyst_1",
@@ -241,32 +249,64 @@ def test_absorb_raises_on_failed_node_result() -> None:
         error=AgentError(code="SQL_ERROR", message="permission denied", retryable=False),
     )
     with pytest.raises(PipelineNodeFailed) as excinfo:
-        pipeline._absorb({"blackboard": {}, "node_results": []}, inv, failed)
+        AnalysisPipeline._absorb(inv, failed, AnalystAgent())
     assert excinfo.value.code == "SQL_ERROR"
     assert excinfo.value.retryable is False
 
 
-def test_absorb_writes_blackboard_entry_on_success() -> None:
-    pipeline = AnalysisPipeline(settings)
+def test_absorb_returns_only_this_node_delta() -> None:
+    """`_absorb` 必须只返回**本节点的增量**，不读旧状态、不做全量写回。
+
+    并行时若「读步初快照 → 合并 → 全量写回」，两个节点的写入会互相覆盖（丢更新）。
+    这是 W5 引入并行后最容易踩的坑，用测试钉死。
+    """
+    from multiagent.agents import RetrieverAgent
+
+    inv = _node_invocation("retriever_2", "retriever")
+    ok = AgentResult(
+        task_id=inv.task_id,
+        node_id="retriever_2",
+        attempt=1,
+        status=ResultStatus.ok,
+        tokens_used={"input": 10, "output": 20, "total": 30},
+        duration_ms=12,
+        outputs={"metric_definitions": {"revenue": {}}, "schema": "sales(...)"},
+        confidence=1.0,
+        sources=[{"type": "sql", "ref": "sha256:abc"}],
+        blackboard_writes=["retriever_2.metrics"],
+    )
+    delta = AnalysisPipeline._absorb(inv, ok, RetrieverAgent())
+
+    assert set(delta) == {"node_outputs", "blackboard", "node_results"}
+    assert delta["node_outputs"] == {"retriever_2": ok.outputs}
+    assert list(delta["blackboard"]) == ["retriever_2.metrics"]
+    entry = delta["blackboard"]["retriever_2.metrics"]
+    assert entry["version"] == 1
+    # 用真实 Agent 版本，不再写死 0.1.0（原先写死的是潜伏 bug）
+    assert entry["written_by"] == "retriever@0.3.0"
+    # 角色要写进 node_results，下游才能按 role 取值而不依赖可变的 node_id
+    assert delta["node_results"][0]["agent_role"] == "retriever"
+
+
+def test_absorb_does_not_leak_previous_state() -> None:
+    """传入同样的输入而不带任何旧状态，输出必须完全由入参决定。"""
+    from multiagent.agents import RetrieverAgent
+
     inv = _node_invocation("retriever_1", "retriever")
     ok = AgentResult(
         task_id=inv.task_id,
         node_id="retriever_1",
         attempt=1,
         status=ResultStatus.ok,
-        tokens_used={"input": 10, "output": 20, "total": 30},
-        duration_ms=12,
-        outputs={"metric_definitions": {"revenue": {}}},
-        confidence=1.0,
-        sources=[{"type": "sql", "ref": "sha256:abc"}],
-        blackboard_writes=["retriever_1.metric_definitions"],
+        tokens_used={"input": 1, "output": 1, "total": 2},
+        duration_ms=1,
+        outputs={"knowledge": []},
+        sources=[{"type": "document", "ref": "知识库:x#0"}],
+        blackboard_writes=["retriever_1.knowledge"],
     )
-    merge = pipeline._absorb({"blackboard": {}, "node_results": []}, inv, ok)
-    assert "retriever_1.metric_definitions" in merge["blackboard"]
-    entry = merge["blackboard"]["retriever_1.metric_definitions"]
-    assert entry["version"] == 1
-    assert entry["written_by"] == "retriever@0.1.0"
-    assert merge["metric_definitions"] == {"revenue": {}}
+    first = AnalysisPipeline._absorb(inv, ok, RetrieverAgent())
+    second = AnalysisPipeline._absorb(inv, ok, RetrieverAgent())
+    assert first == second
 
 
 # ------------------------------------------------- Retriever（需要数据库则跳过）
@@ -338,3 +378,172 @@ def test_analyst_uses_distinct_routes_for_sql_and_conclusion() -> None:
 def test_retriever_records_no_route_because_it_calls_no_model() -> None:
     gateway = FakeGateway()
     assert gateway.routes_seen == []
+
+
+# -------------------------------------------- Retriever 的 mode（两路检索的基础）
+
+
+def _retriever_invocation(node_id: str, **inputs) -> AgentInvocation:
+    return _node_invocation(node_id, "retriever", **inputs)
+
+
+def test_retriever_metrics_mode_skips_knowledge() -> None:
+    """mode=metrics 只走 SQL，不碰知识库——这是两路并行不重叠的前提。"""
+    import asyncio
+
+    gateway = FakeGateway()
+    inv = _retriever_invocation("retriever_1", mode="metrics")
+    result = asyncio.run(RetrieverAgent().invoke(inv, _ctx(gateway)))
+    if result.status is ResultStatus.failed:
+        pytest.skip(f"数据库不可达: {result.error.message}")
+
+    assert "metric_definitions" in result.outputs
+    assert "schema" in result.outputs and "data_ranges" in result.outputs
+    assert "knowledge" not in result.outputs, "metrics 模式不应触发知识库检索"
+    assert result.blackboard_writes == ["retriever_1.metrics"]
+
+
+def test_retriever_knowledge_mode_skips_sql() -> None:
+    import asyncio
+
+    gateway = FakeGateway()
+    inv = _retriever_invocation("retriever_2", mode="knowledge")
+    result = asyncio.run(RetrieverAgent().invoke(inv, _ctx(gateway)))
+
+    assert result.status is ResultStatus.ok
+    assert "knowledge" in result.outputs and "knowledge_count" in result.outputs
+    assert "metric_definitions" not in result.outputs, "knowledge 模式不应查口径表"
+    assert result.blackboard_writes == ["retriever_2.knowledge"]
+
+
+def test_retriever_all_mode_is_default_and_does_both() -> None:
+    """不带 mode 时保持旧行为（all），保证既有单节点链路不被破坏。"""
+    import asyncio
+
+    gateway = FakeGateway()
+    inv = _retriever_invocation("retriever_1")  # 不传 mode
+    result = asyncio.run(RetrieverAgent().invoke(inv, _ctx(gateway)))
+    if result.status is ResultStatus.failed:
+        pytest.skip(f"数据库不可达: {result.error.message}")
+
+    assert "metric_definitions" in result.outputs
+    assert "knowledge" in result.outputs
+    assert set(result.blackboard_writes) == {"retriever_1.metrics", "retriever_1.knowledge"}
+
+
+def test_retriever_rejects_unknown_mode() -> None:
+    import asyncio
+
+    gateway = FakeGateway()
+    inv = _retriever_invocation("retriever_1", mode="telepathy")
+    result = asyncio.run(RetrieverAgent().invoke(inv, _ctx(gateway)))
+    assert result.status is ResultStatus.failed
+    assert result.error.code == "BAD_INPUT"
+    assert result.error.retryable is False
+    assert gateway.calls == 0
+
+
+# ------------------------------------------------ Planner 的角色与模式门禁
+
+
+def _node_payload(
+    node_id: str, role: str, deps: list[str], *, mode: str | None = None
+) -> dict:
+    return {
+        "node_id": node_id,
+        "name": node_id,
+        "agent_role": role,
+        "depends_on": deps,
+        "inputs": {"mode": mode} if mode else {},
+        "outputs": {},
+        "acceptance": ["x"],
+    }
+
+
+def _plan(nodes: list[dict]) -> str:
+    import json
+
+    return json.dumps(
+        {
+            "task_id": "11111111-2222-4333-8444-555555555555",
+            "goal": "g",
+            "created_at": "2026-10-16T12:00:00+08:00",
+            "nodes": nodes,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _plan_with_retrievers(mode_a: str | None, mode_b: str | None) -> str:
+    return _plan(
+        [
+            _node_payload("retriever_1", "retriever", [], mode=mode_a),
+            _node_payload("retriever_2", "retriever", [], mode=mode_b),
+            _node_payload("analyst_1", "analyst", ["retriever_1", "retriever_2"]),
+        ]
+    )
+
+
+def test_planner_accepts_parallel_retrieval_shape() -> None:
+    """W5 的目标形态：两路并行检索（各司其职）+ 一个分析节点。"""
+    import asyncio
+
+    gateway = FakeGateway(_plan_with_retrievers("metrics", "knowledge"))
+    result = asyncio.run(PlannerAgent().invoke(_invocation(), _ctx(gateway)))
+
+    assert result.status is ResultStatus.ok, result.error
+    nodes = result.outputs["dag"]["nodes"]
+    assert [n["node_id"] for n in nodes] == ["retriever_1", "retriever_2", "analyst_1"]
+    assert result.outputs["node_count"] == 3
+
+
+def test_planner_rejects_two_retrievers_without_mode() -> None:
+    """两个 retriever 都不声明 mode 会重复做同一件事——必须拦掉而不是放任浪费。"""
+    import asyncio
+
+    gateway = FakeGateway(_plan_with_retrievers(None, None))
+    result = asyncio.run(PlannerAgent().invoke(_invocation(), _ctx(gateway)))
+    assert result.status is ResultStatus.failed
+    assert result.error.code == "UNSUPPORTED_PLAN"
+    assert "inputs.mode" in result.error.message
+
+
+def test_planner_rejects_duplicate_retriever_modes() -> None:
+    import asyncio
+
+    gateway = FakeGateway(_plan_with_retrievers("metrics", "metrics"))
+    result = asyncio.run(PlannerAgent().invoke(_invocation(), _ctx(gateway)))
+    assert result.status is ResultStatus.failed
+    assert "重复" in result.error.message
+
+
+def test_single_retriever_needs_no_mode() -> None:
+    """单检索节点不必声明 mode（向后兼容），门禁只在多检索时生效。"""
+    import asyncio
+
+    gateway = FakeGateway(
+        _plan(
+            [
+                _node_payload("retriever_1", "retriever", []),
+                _node_payload("analyst_1", "analyst", ["retriever_1"]),
+            ]
+        )
+    )
+    result = asyncio.run(PlannerAgent().invoke(_invocation(), _ctx(gateway)))
+    assert result.status is ResultStatus.ok, result.error
+
+
+def test_planner_requires_available_roles() -> None:
+    """没有可用角色就无从规划：明确报错，不让模型自由发挥。"""
+    import asyncio
+
+    gateway = FakeGateway()
+    inv = _invocation()
+    inv.input.pop("available_roles")
+    result = asyncio.run(PlannerAgent().invoke(inv, _ctx(gateway)))
+    assert result.status is ResultStatus.failed
+    assert result.error.code == "BAD_INPUT"
+    assert gateway.calls == 0, "不该浪费一次模型调用"
+
+
+# ------------------------------------------------------------------------- 运行器

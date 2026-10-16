@@ -80,23 +80,36 @@ class CaseResult:
     knowledge_count: int = 0
 
 
+def _nodes_by_role(outcome, role: str) -> list[dict]:
+    """按 agent_role 取节点结果。
+
+    动态 DAG 下节点 ID 是运行时可变的，**按 role 取值才稳定**——
+    原先写死的 `node_id == "analyst_1"` 在 W5 之后会全线失效。
+    这里直接遍历 node_results（而非调用 PipelineOutcome 的方法），
+    是为了让测试用的假 outcome 也能工作。
+    """
+    return [r for r in outcome.node_results if r.get("agent_role") == role]
+
+
 def _analyst_outputs(outcome) -> dict:
-    for res in outcome.node_results:
-        if res.get("node_id") == "analyst_1":
-            return res.get("outputs", {}) or {}
-    return {}
-
-
-def _retriever_outputs(outcome) -> dict:
-    for res in outcome.node_results:
-        if res.get("node_id") == "retriever_1":
-            return res.get("outputs", {}) or {}
-    return {}
+    """分析节点的产物（多个 analyst 节点时按顺序合并，后者覆盖同名键）。"""
+    merged: dict = {}
+    for res in _nodes_by_role(outcome, "analyst"):
+        merged.update(res.get("outputs") or {})
+    return merged
 
 
 def _retrieved_docs(outcome) -> list[str]:
-    knowledge = _retriever_outputs(outcome).get("knowledge", []) or []
-    return [str(item.get("doc_id", "")) for item in knowledge]
+    """汇总**所有** retriever 节点取到的知识文档。
+
+    检索拆成两路并行后，knowledge 只可能出现在其中一路（mode=knowledge），
+    因此必须遍历全部 retriever 节点，不能只看第一个。
+    """
+    docs: list[str] = []
+    for res in _nodes_by_role(outcome, "retriever"):
+        for item in (res.get("outputs") or {}).get("knowledge", []) or []:
+            docs.append(str(item.get("doc_id", "")))
+    return docs
 
 
 def grade(case: EvalCase, outcome) -> tuple[bool, list[str], list[str], bool]:
@@ -233,6 +246,9 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
         try:
             outcome = await pipeline.run(event)
         except Exception as exc:  # 单条用例失败不应中断整轮评测
+            # 记录完整栈：只留一句异常消息会让间歇性崩溃无从排查
+            import traceback
+
             report.results.append(
                 CaseResult(
                     case_id=case.id,
@@ -244,7 +260,7 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
                     input_tokens=0,
                     output_tokens=0,
                     failed_checks=["exception"],
-                    error=f"{type(exc).__name__}: {exc}",
+                    error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"[:3000],
                 )
             )
             print("崩溃")
