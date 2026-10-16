@@ -1,17 +1,21 @@
 """数据分析 Agent（Analyst）。
 
-三阶段执行，核心是「**把模型从编数字的路径上隔离出去**」：
+流程是三阶段，核心目标是「**把模型从编数字的路径上隔离出去**」：
 1. **取数**：模型只把问题翻译成 SQL，不下结论；
 2. **归因**：只把**沙箱真实执行的结果**喂回模型，且要求每个数字都来自结果。
 
-关键设计（由评测基线暴露的问题驱动）：
-- 规划阶段的**验收标准会传给取数阶段**。首轮评测发现：SQL 只查了 9 月、
-  没查 8 月做对比，导致归因阶段（被限制只能用结果里的真实数据）只能诚实拒绝。
-  根因是「写 SQL 的一步不知道下结论需要什么」，故把验收标准透传下来。
+关键设计（每一处都由评测基线暴露的问题驱动）：
+
+- **规划阶段的验收标准会传给取数阶段**。首轮评测发现：SQL 只查了 9 月、没查 8 月
+  做对比，导致归因阶段（被限制只能用结果里的真实数据）只能诚实拒绝。根因是
+  「写 SQL 的一步不知道下结论需要什么」。
 - **验收标准不传给归因阶段**。归因阶段若知道期望答案，会有迎合压力而编造数字；
   它的唯一输入是真实结果行。
-- **不足即修补**：若归因判定数据不足，允许**重写一次 SQL** 再试（最多一次）。
-  真正的动态重规划属于 W7，这里只做一次有界修补。
+- **数据真实时间范围会传给取数阶段**。评测中模型凭空假设年份，写出
+  `stat_date='2025-08-01'` 这类范围外条件，聚合结果全为 NULL。
+- **有界修补覆盖两类失败**：(a) SQL 被数据库拒绝（如 GROUP BY 与窗口函数冲突）；
+  (b) 归因判定数据不足。两类都会把原因回灌、重新生成 SQL，最多重试到
+  `MAX_SQL_ATTEMPTS` 次。真正的动态重规划属于 W7，这里只做有界修补。
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import time
 from pydantic import BaseModel, Field
 
 from ..contracts import AgentInvocation, AgentResult, SourceRef, SourceType
+from ..tools import SqlExecutionError, SqlResult
 from .base import AgentContext, BaseAgent, _Usage
 
 _SQL_RULES = """硬性要求：
@@ -32,15 +37,17 @@ _SQL_RULES = """硬性要求：
    下游只会基于你返回的结果做判断，缺少基期数据将导致无法给出结论。
 5. 查询结果要足以支撑下面列出的「验收标准」，每条都要有对应数据可用。
 6. **日期条件必须落在「数据实际覆盖范围」之内**（见下方说明）。不得假设数据里
-   存在其它年份或月份——写成范围外的日期会让聚合结果全为 NULL，导致无法给出结论。
-7. 输出单个 JSON 对象，不要 markdown 围栏：
+   存在其它年份或月份——写成范围外的日期会让聚合结果全为 NULL。
+7. **SQL 语法必须能被 PostgreSQL 16 直接执行**：使用 GROUP BY 时，
+   非聚合列必须出现在 GROUP BY 中；窗口函数不要与 GROUP BY 混用在非分组列上。
+8. 输出单个 JSON 对象，不要 markdown 围栏：
    {"sql": "<SQL 原文>", "rationale": "<为什么这样查，一句话>"}"""
 
 _SQL_SYSTEM = f"""你是数据分析师的取数环节。你的唯一任务是：把业务问题翻译成一条**只读** SQL 查询。
 
 {_SQL_RULES}"""
 
-_SQL_REPAIR_SYSTEM = f"""你是数据分析师的取数环节。你上一轮生成的 SQL 被判定为**结果不足以支撑结论**，
+_SQL_REPAIR_SYSTEM = f"""你是数据分析师的取数环节。你上一轮生成的 SQL 没有通过（被数据库拒绝，或结果不足以支撑结论），
 请根据反馈重写。
 
 {_SQL_RULES}"""
@@ -72,9 +79,14 @@ class _Conclusion(BaseModel):
 
 class AnalystAgent(BaseAgent):
     role = "analyst"
-    version = "0.2.0"
+    version = "0.3.0"
 
-    MAX_SQL_ATTEMPTS = 2  # 初次 + 至多一次修补
+    # 初次 + 至多一次修补。
+    # 该上限由 20 条评测基线定：两类失败（SQL 被拒绝、归因判定数据不足）
+    # 都在**下一次尝试**即被修复；设到 3 次时唯一效果是造出最差离群点
+    # （biggest_contributor 166.6 秒 / 40,600 token），成功率并未提高。
+    # 放宽重试属于 W7 的异常处理范畴，且需配合任务级 Token 熔断。
+    MAX_SQL_ATTEMPTS = 2
 
     async def _generate_sql(
         self,
@@ -136,52 +148,54 @@ class AnalystAgent(BaseAgent):
             f"指标口径：\n{defs_text}\n\n业务问题：{question}"
         )
 
-        try:
-            repair_feedback: str | None = None
-            plan = await self._generate_sql(
-                ctx,
-                usage=usage,
-                base_user=base_user,
-                acceptance_text=acceptance_text,
-            )
-            result = ctx.sandbox.execute(plan.sql)
-            conclusion = await self._conclude(
-                ctx,
-                usage=usage,
-                question=question,
-                sql=result.sql,
-                rows_text=result.as_prompt_text(),
-                row_count=result.row_count,
-            )
+        best: tuple[_SqlPlan, SqlResult, _Conclusion] | None = None
+        feedback: str | None = None
+        attempts = 0
+        problems: list[str] = []
 
-            # 数据不足时做一次有界修补：把「缺什么」回灌给取数环节重写 SQL
-            sql_attempts = 1
-            if conclusion.insufficient_data and self.MAX_SQL_ATTEMPTS > 1:
-                repair_feedback = (
-                    f"{conclusion.summary}\n"
-                    f"上一轮 SQL：\n{plan.sql}\n"
-                    f"上一轮结果（{result.row_count} 行）：\n{result.as_prompt_text(20)}"
-                )
-                plan2 = await self._generate_sql(
-                    ctx,
-                    usage=usage,
-                    base_user=base_user,
-                    acceptance_text=acceptance_text,
-                    repair_feedback=repair_feedback,
-                )
-                result2 = ctx.sandbox.execute(plan2.sql)
-                conclusion2 = await self._conclude(
+        try:
+            while attempts < self.MAX_SQL_ATTEMPTS:
+                attempts += 1
+                try:
+                    plan = await self._generate_sql(
+                        ctx,
+                        usage=usage,
+                        base_user=base_user,
+                        acceptance_text=acceptance_text,
+                        repair_feedback=feedback,
+                    )
+                    result = ctx.sandbox.execute(plan.sql)
+                except SqlExecutionError as exc:
+                    problems.append(f"第{attempts}次 SQL 被拒绝: {str(exc)[:200]}")
+                    if best is not None:
+                        break  # 已有可用结果，不再为报错消耗额度
+                    feedback = (
+                        f"上一轮 SQL 被数据库拒绝，报错如下：\n{str(exc)[:400]}\n"
+                        "请修正。注意：使用 GROUP BY 时非聚合列必须出现在 GROUP BY 中。"
+                    )
+                    continue
+
+                conclusion = await self._conclude(
                     ctx,
                     usage=usage,
                     question=question,
-                    sql=result2.sql,
-                    rows_text=result2.as_prompt_text(),
-                    row_count=result2.row_count,
+                    sql=result.sql,
+                    rows_text=result.as_prompt_text(),
+                    row_count=result.row_count,
                 )
-                sql_attempts = 2
-                # 修补后仍不足则保留修补结果；若补上了则采用新结论
-                if not conclusion2.insufficient_data or result2.row_count > result.row_count:
-                    plan, result, conclusion = plan2, result2, conclusion2
+                if best is None or not conclusion.insufficient_data:
+                    best = (plan, result, conclusion)
+                if not conclusion.insufficient_data:
+                    break
+
+                problems.append(f"第{attempts}次数据不足: {conclusion.summary[:150]}")
+                feedback = (
+                    f"{conclusion.summary}\n上一轮 SQL：\n{plan.sql}\n"
+                    f"上一轮结果（{result.row_count} 行）：\n{result.as_prompt_text(20)}"
+                )
+
+            if best is None:
+                raise SqlExecutionError("；".join(problems) or "所有 SQL 尝试均未成功")
         except Exception as exc:
             code, retryable = self.classify_error(exc)
             return self.failed(
@@ -193,13 +207,15 @@ class AnalystAgent(BaseAgent):
                 duration_ms=int((time.perf_counter() - started) * 1000),
             )
 
+        plan, result, conclusion = best
         return self.ok(
             inv,
             outputs={
                 "sql": result.sql,
                 "sql_hash": result.sql_hash,
                 "sql_rationale": plan.rationale,
-                "sql_attempts": sql_attempts,
+                "sql_attempts": attempts,
+                "repair_problems": problems,
                 "row_count": result.row_count,
                 "rows_preview": result.rows[:50],
                 "result_limited": result.limited,
