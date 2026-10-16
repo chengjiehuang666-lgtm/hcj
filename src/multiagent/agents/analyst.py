@@ -25,6 +25,7 @@ import time
 from pydantic import BaseModel, Field
 
 from ..contracts import AgentInvocation, AgentResult, SourceRef, SourceType
+from ..gateway import ROUTE_ANALYST_CONCLUDE, ROUTE_ANALYST_SQL
 from ..tools import SqlExecutionError, SqlResult
 from .base import AgentContext, BaseAgent, _Usage
 
@@ -104,7 +105,12 @@ class AnalystAgent(BaseAgent):
         if repair_feedback:
             user += f"\n\n上一轮的问题反馈：\n{repair_feedback}"
         return await self.call_json(
-            ctx, system=system, user=user, model_cls=_SqlPlan, usage=usage
+            ctx,
+            system=system,
+            user=user,
+            model_cls=_SqlPlan,
+            usage=usage,
+            route=ROUTE_ANALYST_SQL,
         )
 
     async def _conclude(
@@ -120,6 +126,7 @@ class AnalystAgent(BaseAgent):
             ),
             model_cls=_Conclusion,
             usage=usage,
+            route=ROUTE_ANALYST_CONCLUDE,
         )
 
     async def invoke(self, inv: AgentInvocation, ctx: AgentContext) -> AgentResult:

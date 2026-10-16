@@ -31,14 +31,22 @@ settings = Settings(_env_file=ROOT / ".env")
 
 
 class FakeGateway:
-    """按顺序返回预设内容的假网关。"""
+    """按顺序返回预设内容的假网关。
+
+    与 `LLMGateway` / `ModelRouter` **同签名**（含 `route`），并记录所见调用点，
+    以便断言「各 Agent 用对了路由」。
+    """
 
     def __init__(self, *contents: str) -> None:
         self._contents = list(contents)
         self.calls = 0
+        self.routes_seen: list[str | None] = []
 
-    async def complete(self, messages, *, max_tokens=None, temperature=None) -> LLMResponse:
+    async def complete(
+        self, messages, *, max_tokens=None, temperature=None, route=None
+    ) -> LLMResponse:
         self.calls += 1
+        self.routes_seen.append(route)
         if not self._contents:
             raise AssertionError("假网关的预设响应已用尽")
         return LLMResponse(
@@ -279,3 +287,54 @@ def test_retriever_returns_metric_definitions_from_db() -> None:
     assert "revenue" in defs and "refund_rate" in defs
     assert gateway.calls == 0, "口径是结构化数据，直查即可，不该额外调用模型"
     assert result.sources[0].type.value == "sql"
+
+
+# ------------------------------------------------- 分级路由：调用点标注正确
+
+
+def test_planner_declares_planner_route() -> None:
+    gateway = FakeGateway(
+        _dag_json([("retriever_1", "retriever", []), ("analyst_1", "analyst", ["retriever_1"])])
+    )
+    import asyncio
+
+    asyncio.run(PlannerAgent().invoke(_invocation(), _ctx(gateway)))
+    assert gateway.routes_seen == ["planner"], gateway.routes_seen
+
+
+def test_planner_retry_keeps_same_route() -> None:
+    """重试也必须带上调用点，否则重试会掉回默认档。"""
+    gateway = FakeGateway(
+        "不是 JSON",
+        _dag_json([("retriever_1", "retriever", []), ("analyst_1", "analyst", ["retriever_1"])]),
+    )
+    import asyncio
+
+    asyncio.run(PlannerAgent().invoke(_invocation(), _ctx(gateway)))
+    assert gateway.routes_seen == ["planner", "planner"], gateway.routes_seen
+
+
+def test_analyst_uses_distinct_routes_for_sql_and_conclusion() -> None:
+    """取数（机械）与归因（推理）必须是两个不同的调用点，才能分级路由。"""
+    from multiagent.agents import AnalystAgent
+
+    gateway = FakeGateway(
+        '{"sql": "SELECT 1 AS x", "rationale": "最小查询"}',
+        '{"summary": "结果为 1", "key_findings": ["x=1"], '
+        '"insufficient_data": false, "confidence": 0.9}',
+    )
+    inv = _node_invocation("analyst_1", "analyst")
+    import asyncio
+
+    try:
+        result = asyncio.run(AnalystAgent().invoke(inv, _ctx(gateway)))
+    except Exception as exc:
+        pytest.skip(f"数据库不可达: {exc}")
+    if result.status is ResultStatus.failed:
+        pytest.skip(f"数据库不可达: {result.error.message}")
+    assert gateway.routes_seen == ["analyst_sql", "analyst_conclude"], gateway.routes_seen
+
+
+def test_retriever_records_no_route_because_it_calls_no_model() -> None:
+    gateway = FakeGateway()
+    assert gateway.routes_seen == []

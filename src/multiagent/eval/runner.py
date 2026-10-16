@@ -72,6 +72,9 @@ class CaseResult:
     sql_hash: str | None = None
     summary: str = ""
     error: str | None = None
+    #: 按调用点（planner / analyst_sql / analyst_conclude）的成本与时延归因。
+    #: 分级路由靠它决定哪些调用点值得切到 fast 档。
+    route_tokens: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 def _analyst_outputs(outcome) -> dict:
@@ -169,6 +172,25 @@ class EvalReport:
             return 0
         return data[min(len(data) - 1, int(round(0.95 * (len(data) - 1))))]
 
+    def route_summary(self) -> dict[str, dict[str, int]]:
+        """跨全部用例，按调用点汇总次数/token/耗时。"""
+        summary: dict[str, dict[str, int]] = {}
+        for result in self.results:
+            for route, stats in (result.route_tokens or {}).items():
+                bucket = summary.setdefault(
+                    route,
+                    {
+                        "calls": 0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                        "duration_ms": 0,
+                    },
+                )
+                for key in bucket:
+                    bucket[key] += stats.get(key, 0)
+        return summary
+
 
 async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
     pipeline = AnalysisPipeline(settings)
@@ -223,6 +245,7 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
                 sql_hash=outputs.get("sql_hash"),
                 summary=(outcome.summary or "")[:200],
                 error=outcome.error,
+                route_tokens=outcome.tokens_by_route,
             )
         )
         if passed:
@@ -272,6 +295,28 @@ def render_markdown(report: EvalReport) -> str:
     suggestion = int(report.max_tokens * 1.5 / 10000 + 0.9999) * 10000
     add(f"| **建议 `DEFAULT_MAX_TOKENS`** | **{suggestion:,}**（最大实测 × 1.5 安全系数，向上取整到万） |")
     add("")
+
+    # ---- 按调用点归因：分级路由的决策依据 ----
+    routes = report.route_summary()
+    if routes:
+        llm_ms = sum(s["duration_ms"] for s in routes.values())
+        wall_ms = sum(r.latency_ms for r in report.results)
+        add("## 按调用点的成本/时延归因（分级路由依据）")
+        add("")
+        add(f"模型调用总耗时 {llm_ms / 1000:.1f} 秒，占全部用例墙钟耗时（{wall_ms / 1000:.1f} 秒）的 "
+            f"**{100 * llm_ms / wall_ms if wall_ms else 0:.0f}%**——其余为数据库与编排开销。")
+        add("")
+        add("| 调用点 | 次数 | 总 token | 单次均值 | 总耗时 | 占模型调用耗时 | 单次均值 |")
+        add("| :--- | --: | --: | --: | --: | --: | --: |")
+        for route, stats in sorted(routes.items(), key=lambda kv: -kv[1]["duration_ms"]):
+            calls = max(stats["calls"], 1)
+            share = 100 * stats["duration_ms"] / llm_ms if llm_ms else 0
+            add(
+                f"| `{route}` | {stats['calls']} | {stats['total_tokens']:,} | "
+                f"{stats['total_tokens'] // calls:,} | {stats['duration_ms'] / 1000:.1f}s | "
+                f"{share:.0f}% | {stats['duration_ms'] / calls / 1000:.1f}s |"
+            )
+        add("")
 
     add("## 逐条结果")
     add("")

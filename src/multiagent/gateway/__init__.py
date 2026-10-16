@@ -1,15 +1,13 @@
-"""LLM 网关：供应商无关的统一调用与降级。
+"""LLM 网关：供应商无关的统一调用、主备降级与分级路由。
 
-设计要点：
-- 业务代码只依赖 `LLMProvider` 抽象，不直接发 HTTP；换供应商只改配置。
-- DeepSeek / 通义千问 Qwen / 智谱 GLM 均提供 OpenAI 兼容接口，
-  因此三者共用 `OpenAICompatibleProvider` 一个实现。
-- `LLMGateway` 负责主备降级：主模型失败或未配置 key 时自动切备用，
-  两次都失败才抛错，并在异常中保留两条失败原因，避免静默失败。
+- `LLMGateway`：一条主备供应商链（主失败自动切备）
+- `ModelRouter`：按调用点把请求分派到不同档位的 LLMGateway（分级路由）
+- 两者 `complete()` 签名一致，可直接互换；业务侧只依赖这个签名。
 """
 
 from .base import (
     AllProvidersFailedError,
+    CallRecord,
     EmptyCompletionError,
     GatewayError,
     LLMMessage,
@@ -18,22 +16,53 @@ from .base import (
     MessageRole,
     ProviderUnavailableError,
 )
-from .gateway import LLMGateway, build_gateway, build_gateway_from_settings
+from .gateway import (
+    LLMGateway,
+    build_gateway,
+    build_gateway_from_providers,
+    build_gateway_from_settings,
+)
 from .openai_compatible import OpenAICompatibleProvider
+from .router import (
+    KNOWN_ROUTES,
+    ROUTE_ANALYST_CONCLUDE,
+    ROUTE_ANALYST_SQL,
+    ROUTE_DEFAULT,
+    ROUTE_PLANNER,
+    TIER_FAST,
+    TIER_REASONING,
+    ModelRouter,
+    build_router_from_settings,
+)
 from .stub import StubProvider
 
 __all__ = [
+    # 网关与路由器
     "LLMGateway",
+    "ModelRouter",
     "build_gateway",
+    "build_gateway_from_providers",
     "build_gateway_from_settings",
+    "build_router_from_settings",
+    # 档位与调用点
+    "TIER_REASONING",
+    "TIER_FAST",
+    "ROUTE_PLANNER",
+    "ROUTE_ANALYST_SQL",
+    "ROUTE_ANALYST_CONCLUDE",
+    "ROUTE_DEFAULT",
+    "KNOWN_ROUTES",
+    # 数据结构与异常
     "LLMProvider",
     "LLMMessage",
     "LLMResponse",
     "MessageRole",
+    "CallRecord",
     "GatewayError",
     "ProviderUnavailableError",
     "EmptyCompletionError",
     "AllProvidersFailedError",
+    # 具体实现
     "StubProvider",
     "OpenAICompatibleProvider",
 ]

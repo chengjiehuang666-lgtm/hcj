@@ -12,6 +12,7 @@ from __future__ import annotations
 import time
 
 from ..contracts import AgentInvocation, AgentResult, SourceRef, SourceType, SubtaskDAG
+from ..gateway import ROUTE_PLANNER
 from .base import AgentContext, BaseAgent, _Usage
 
 SYSTEM_PROMPT = """你是任务规划专家，负责把业务分析需求拆解为可由专家 Agent 执行的有向无环任务图。
@@ -78,7 +79,12 @@ class PlannerAgent(BaseAgent):
 
         try:
             dag = await self.call_json(
-                ctx, system=SYSTEM_PROMPT, user=user, model_cls=SubtaskDAG, usage=usage
+                ctx,
+                system=SYSTEM_PROMPT,
+                user=user,
+                model_cls=SubtaskDAG,
+                usage=usage,
+                route=ROUTE_PLANNER,
             )
         except Exception as exc:
             code, retryable = self.classify_error(exc)

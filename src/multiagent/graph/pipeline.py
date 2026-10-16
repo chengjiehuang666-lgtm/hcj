@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, TypedDict
 
@@ -33,7 +33,7 @@ from ..contracts import (
     TaskEvent,
     to_wire,
 )
-from ..gateway import build_gateway_from_settings
+from ..gateway import build_router_from_settings
 from ..tools import SqlSandbox
 
 # 业务时区（东八区）。平台面向国内业务，统一用它，避免「上月」算错月份。
@@ -76,6 +76,32 @@ class PipelineOutcome:
     total_tokens: int = 0
     duration_ms: int = 0
     error: str | None = None
+    #: 逐次模型调用明细（按发生顺序）。供分级路由的成本/时延归因与 W10 成本计量使用。
+    #: 注意：这是**内部结构**，不属于任何已冻结的契约。
+    call_records: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def tokens_by_route(self) -> dict[str, dict[str, int]]:
+        """按调用点汇总次数/token/耗时——分级路由的归因入口。"""
+        summary: dict[str, dict[str, int]] = {}
+        for record in self.call_records:
+            key = record.get("route") or "(未标注)"
+            bucket = summary.setdefault(
+                key,
+                {
+                    "calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "duration_ms": 0,
+                },
+            )
+            bucket["calls"] += 1
+            bucket["input_tokens"] += record.get("input_tokens", 0)
+            bucket["output_tokens"] += record.get("output_tokens", 0)
+            bucket["total_tokens"] += record.get("total_tokens", 0)
+            bucket["duration_ms"] += record.get("duration_ms", 0)
+        return summary
 
     @property
     def total_input_tokens(self) -> int:
@@ -227,10 +253,11 @@ class AnalysisPipeline:
 
         started = time.perf_counter()
         task_id = str(event.task_id)
-        gateway = build_gateway_from_settings(self.settings)
+        # 用路由器而非单条主备链：按调用点分派到不同档位（分级路由）
+        router = build_router_from_settings(self.settings)
         ctx = AgentContext(
             settings=self.settings,
-            gateway=gateway,
+            gateway=router,
             sandbox=SqlSandbox(self.settings),
         )
         graph = self._build(ctx)
@@ -263,6 +290,7 @@ class AnalysisPipeline:
                 status="failed",
                 error=f"[{exc.code}] {exc.message}",
                 duration_ms=int((time.perf_counter() - started) * 1000),
+                call_records=_serialize_call_records(router),
             )
         finally:
             await pool.close()
@@ -278,8 +306,17 @@ class AnalysisPipeline:
             dag=final.get("dag", {}),
             total_tokens=sum(r.get("tokens_used", {}).get("total", 0) for r in node_results),
             duration_ms=duration_ms,
+            call_records=_serialize_call_records(router),
         )
+        if unmapped := getattr(router, "unmapped_routes", None):
+            # 路由表漏配不是致命错误（会退回默认档），但必须能被发现
+            outcome.error = f"路由表未配置的调用点: {sorted(unmapped)}"
         return outcome
+
+
+def _serialize_call_records(router) -> list[dict[str, Any]]:
+    """把网关的逐次调用记录转为可序列化字典（按发生顺序）。"""
+    return [asdict(record) for record in getattr(router, "history", [])]
 
 
 def new_task_event(question: str, *, deadline_minutes: int = 5) -> TaskEvent:

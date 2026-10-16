@@ -26,11 +26,13 @@ from ..contracts import (
     TokenUsage,
 )
 from ..gateway import (
+    ROUTE_DEFAULT,
     AllProvidersFailedError,
     EmptyCompletionError,
     GatewayError,
     LLMGateway,
     LLMMessage,
+    ModelRouter,
 )
 from ..tools import SqlExecutionError, SqlSandbox
 
@@ -45,10 +47,15 @@ class AgentOutputError(Exception):
 
 @dataclass
 class AgentContext:
-    """一次任务执行期间 Agent 可用的资源。"""
+    """一次任务执行期间 Agent 可用的资源。
+
+    `gateway` 既可以是 `LLMGateway`（单条主备链），也可以是 `ModelRouter`
+    （分级路由）。两者具有完全相同的 `complete()` 签名，因此可互换；
+    传 `ModelRouter` 时，调用方通过 `route` 指定调用点来选档位。
+    """
 
     settings: Settings
-    gateway: LLMGateway
+    gateway: LLMGateway | ModelRouter
     sandbox: SqlSandbox
 
 
@@ -113,15 +120,23 @@ class BaseAgent(ABC):
         usage: _Usage,
         max_tokens: int | None = None,
         attempts: int = 2,
+        route: str = ROUTE_DEFAULT,
     ) -> TModel:
-        """要求模型输出符合 `model_cls` 的 JSON，解析失败时把错误回灌重试。"""
+        """要求模型输出符合 `model_cls` 的 JSON，解析失败时把错误回灌重试。
+
+        `route` 标识**调用点**（见 `gateway/router.py` 的 `ROUTE_*`）。
+        当 `ctx.gateway` 是 `ModelRouter` 时，它据此选择档位——例如把「生成 SQL」
+        这类机械步骤路由到 fast 档的低延迟模型，把归因留给推理型模型。
+        """
         if max_tokens is None:
             max_tokens = ctx.settings.llm_max_output_tokens
         messages = [LLMMessage.system(system), LLMMessage.user(user)]
         last_error: Exception | None = None
 
         for attempt in range(1, attempts + 1):
-            response = await ctx.gateway.complete(messages, max_tokens=max_tokens)
+            response = await ctx.gateway.complete(
+                messages, max_tokens=max_tokens, route=route
+            )
             usage.add(response)
             try:
                 payload = extract_json(response.content)

@@ -10,7 +10,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -47,6 +47,35 @@ class Settings(BaseSettings):
     llm_fallback_model: str = "qwen-plus"
     llm_fallback_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     llm_fallback_api_key: SecretStr | None = None
+
+    # ---- fast 档：机械步骤用的低延迟模型（分级路由）----
+    # 上面 primary/fallback 构成 reasoning 档（强推理模型，用于规划与归因）；
+    # 本组构成 fast 档，用于「生成 SQL」这类不需要深度思考的调用点。
+    # 默认指向非推理型的本地端点——实测一次简单调用 3.39 秒 / 87 token，
+    # 比推理型低一到两个数量级；本地不可用时自动降级到 fast 档的备模型。
+    llm_fast_primary_provider: str = "zhipu"
+    llm_fast_primary_model: str = "glm-5.3"
+    llm_fast_primary_base_url: str = "http://127.0.0.1:7863/v1"
+    llm_fast_primary_api_key: SecretStr | None = None
+
+    llm_fast_fallback_provider: str = "deepseek"
+    llm_fast_fallback_model: str = "deepseek-flash"
+    llm_fast_fallback_base_url: str = "https://api.deepseek.com/v1"
+    llm_fast_fallback_api_key: SecretStr | None = None
+
+    # ---- 分级路由表 ----
+    # 调用点 -> 档位（reasoning | fast）。改路由只需改这里，不用改代码。
+    # 调用点名见 gateway/router.py 的 ROUTE_* 常量。
+    # 默认全部走 reasoning，即与引入分级路由之前的行为完全一致——先建机制、
+    # 再用测量数据决定哪些调用点切到 fast（见《实施路线图》3.7）。
+    llm_default_tier: str = "reasoning"
+    llm_routing: dict[str, str] = Field(
+        default_factory=lambda: {
+            "planner": "reasoning",
+            "analyst_sql": "reasoning",
+            "analyst_conclude": "reasoning",
+        }
+    )
 
     # ---- 基础设施（与 docker-compose.yml 默认值一致）----
     postgres_dsn: str = "postgresql://multiagent:multiagent@localhost:5432/multiagent"
@@ -90,6 +119,28 @@ class Settings(BaseSettings):
             base_url=self.llm_fallback_base_url,
             api_key=self.llm_fallback_api_key,
         )
+
+    @property
+    def fast_primary(self) -> ProviderConfig:
+        return ProviderConfig(
+            provider=self.llm_fast_primary_provider,
+            model=self.llm_fast_primary_model,
+            base_url=self.llm_fast_primary_base_url,
+            api_key=self.llm_fast_primary_api_key,
+        )
+
+    @property
+    def fast_fallback(self) -> ProviderConfig:
+        return ProviderConfig(
+            provider=self.llm_fast_fallback_provider,
+            model=self.llm_fast_fallback_model,
+            base_url=self.llm_fast_fallback_base_url,
+            api_key=self.llm_fast_fallback_api_key,
+        )
+
+    def tier_for(self, route: str) -> str:
+        """查询某个调用点走哪个档位（与 ModelRouter.tier_for 的判定保持一致）。"""
+        return self.llm_routing.get(route, self.llm_default_tier)
 
 
 @lru_cache(maxsize=1)

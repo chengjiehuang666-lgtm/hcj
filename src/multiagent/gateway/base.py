@@ -120,7 +120,7 @@ class LLMProvider(ABC):
 
 @dataclass
 class CallRecord:
-    """一次网关调用的记录，供成本计量（W10）与审计使用。"""
+    """一次网关调用的记录，供成本计量（W10）、分级路由归因与审计使用。"""
 
     provider: str
     model: str
@@ -128,3 +128,11 @@ class CallRecord:
     total_tokens: int = 0
     degraded: bool = False
     chain: list[str] = field(default_factory=list)
+    # ---- 分级路由归因用 ----
+    # route：标识本次调用来自哪个调用点（planner / analyst_sql / …），
+    #        直接使用 LLMGateway 时为 None。
+    # duration_ms：本次调用（含降级尝试）的墙钟耗时。
+    route: str | None = None
+    duration_ms: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
