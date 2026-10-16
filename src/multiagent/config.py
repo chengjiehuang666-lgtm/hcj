@@ -88,6 +88,18 @@ class Settings(BaseSettings):
     sql_max_rows: int = 500
     sql_timeout_seconds: int = 10
 
+    # ---- Python 沙箱约束（见 tools/python.py）----
+    # auto：能用容器就用容器，否则降到子进程（隔离强度显著更弱，结果里会标注）
+    # container：强制容器，不可用则直接报错——评测/生产建议用它，避免静默降级
+    python_sandbox_mode: Literal["auto", "container", "subprocess"] = "auto"
+    python_sandbox_image: str = "multiagent-python-sandbox:latest"
+    # Windows 上 Docker Desktop 多为用户级安装、不在 PATH 里，
+    # 此时在此填 docker 可执行文件的完整路径。
+    python_sandbox_docker_cli: str = "docker"
+    python_sandbox_timeout_seconds: int = 30
+    python_sandbox_memory_mb: int = 512
+    python_sandbox_cpus: float = 1.0
+
     # ---- 表结构自省的白名单/黑名单 ----
     # 排除框架自身建的表。LangGraph 的 PostgresSaver 会在 public schema 下建
     # checkpoints / checkpoint_blobs / checkpoint_writes / checkpoint_migrations 四张表；
