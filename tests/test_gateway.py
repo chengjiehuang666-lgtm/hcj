@@ -22,6 +22,7 @@ import httpx  # noqa: E402
 from multiagent.config import Settings  # noqa: E402
 from multiagent.gateway import (  # noqa: E402
     AllProvidersFailedError,
+    EmptyCompletionError,
     LLMGateway,
     LLMMessage,
     OpenAICompatibleProvider,
@@ -175,6 +176,104 @@ def test_live_mode_without_keys_degrades_then_fails_cleanly() -> None:
         assert all("API key" in reason for _, reason in exc.failures)
         return
     raise AssertionError("live 模式且无 key 时应在两次降级后抛错")
+
+
+# ------------------------------------------------- 推理型模型的额度耗尽陷阱
+#
+# deepseek-flash 等推理型模型先产出 reasoning_content 再产出 content，
+# max_tokens 由两者共享。额度偏小时 content 为空且 finish_reason=length。
+# 这类结果必须显式报错，不得静默返回空字符串。
+
+_REASONING_ONLY_BODY = {
+    "model": "deepseek-flash",
+    "choices": [
+        {
+            "message": {"role": "assistant", "content": "", "reasoning_content": "The user wants..."},
+            "finish_reason": "length",
+        }
+    ],
+    "usage": {
+        "prompt_tokens": 35,
+        "completion_tokens": 20,
+        "completion_tokens_details": {"reasoning_tokens": 20},
+    },
+}
+
+_REASONING_WITH_CONTENT_BODY = {
+    "model": "deepseek-flash",
+    "choices": [
+        {
+            "message": {"role": "assistant", "content": "正常", "reasoning_content": "The user wants..."},
+            "finish_reason": "stop",
+        }
+    ],
+    "usage": {
+        "prompt_tokens": 35,
+        "completion_tokens": 28,
+        "completion_tokens_details": {"reasoning_tokens": 26},
+    },
+}
+
+_REASONING_TRUNCATED_WITH_CONTENT_BODY = {
+    "model": "deepseek-flash",
+    "choices": [
+        {
+            "message": {"role": "assistant", "content": "部分结论，未写完", "reasoning_content": "..."},
+            "finish_reason": "length",
+        }
+    ],
+    "usage": {
+        "prompt_tokens": 35,
+        "completion_tokens": 60,
+        "completion_tokens_details": {"reasoning_tokens": 20},
+    },
+}
+
+
+def test_budget_exhausted_by_reasoning_raises_instead_of_silent_empty() -> None:
+    provider = _provider_with_handler(lambda req: httpx.Response(200, json=_REASONING_ONLY_BODY))
+    try:
+        _run_async(provider.complete([LLMMessage.user("只回复两个字：正常")], max_tokens=20))
+    except EmptyCompletionError as exc:
+        assert exc.reasoning_tokens == 20, exc.reasoning_tokens
+        assert exc.finish_reason == "length"
+        assert "max_tokens" in str(exc), "错误信息应提示调大 max_tokens"
+        return
+    raise AssertionError("额度被思考耗尽导致 content 为空时必须报错，不得静默返回空串")
+
+
+def test_reasoning_tokens_recorded_for_cost_metering() -> None:
+    provider = _provider_with_handler(
+        lambda req: httpx.Response(200, json=_REASONING_WITH_CONTENT_BODY)
+    )
+    resp = _run_async(provider.complete([LLMMessage.user("hi")]))
+    assert resp.content == "正常"
+    assert resp.reasoning_tokens == 26
+    assert resp.output_tokens == 28, "reasoning_tokens 已计入 completion_tokens，不应重复累加"
+    assert resp.total_tokens == 63
+    assert resp.truncated is False
+
+
+def test_truncated_flag_surfaces_partial_output() -> None:
+    provider = _provider_with_handler(
+        lambda req: httpx.Response(200, json=_REASONING_TRUNCATED_WITH_CONTENT_BODY)
+    )
+    resp = _run_async(provider.complete([LLMMessage.user("hi")], max_tokens=60))
+    assert resp.truncated is True, "finish_reason=length 时应标记为截断"
+    assert resp.content
+
+
+def test_empty_completion_triggers_fallback_to_other_provider() -> None:
+    gw = LLMGateway(
+        primary=_provider_with_handler(
+            lambda req: httpx.Response(200, json=_REASONING_ONLY_BODY)
+        ),
+        fallback=StubProvider(name="fallback"),
+    )
+    resp = _run_async(gw.complete([LLMMessage.user("hi")], max_tokens=20))
+    assert resp.provider == "fallback"
+    assert gw.history[-1].degraded is True
+    assert gw.history[-1].chain == ["deepseek", "fallback"]
 
 
 # ---------------------------------------------------------------------- 配置

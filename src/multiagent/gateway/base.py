@@ -35,10 +35,16 @@ class LLMResponse:
     input_tokens: int
     output_tokens: int
     finish_reason: str | None = None
+    reasoning_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
+
+    @property
+    def truncated(self) -> bool:
+        """是否因 token 额度耗尽被截断（finish_reason=length）。"""
+        return self.finish_reason == "length"
 
 
 class GatewayError(Exception):
@@ -52,6 +58,29 @@ class ProviderUnavailableError(GatewayError):
         self.provider = provider
         self.reason = reason
         super().__init__(f"供应商 '{provider}' 不可用: {reason}")
+
+
+class EmptyCompletionError(GatewayError):
+    """模型返回了空内容。
+
+    对**推理型模型**（如 deepseek-flash、GLM-Z 系列）这是常见陷阱：
+    它们先产生 reasoning_content，再产生 content，而 max_tokens 由两者共享。
+    额度偏小时，全部 token 会被思考过程吃掉，content 为空且 finish_reason=length。
+    这类结果必须显式报错，绝不能当作正常的空字符串返回给调用方。
+    """
+
+    def __init__(self, provider: str, finish_reason: str | None, reasoning_tokens: int) -> None:
+        self.provider = provider
+        self.finish_reason = finish_reason
+        self.reasoning_tokens = reasoning_tokens
+        hint = (
+            f"（finish_reason={finish_reason}，思考已消耗 {reasoning_tokens} tokens，"
+            "推理型模型需显著调大 max_tokens）"
+            if reasoning_tokens
+            else f"（finish_reason={finish_reason}）"
+        )
+        self.reason = f"模型返回空内容 {hint}"
+        super().__init__(f"供应商 '{provider}' 返回空内容 {hint}")
 
 
 class AllProvidersFailedError(GatewayError):

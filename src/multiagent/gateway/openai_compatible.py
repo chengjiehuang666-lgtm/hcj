@@ -12,7 +12,13 @@ from typing import Any
 
 import httpx
 
-from .base import LLMMessage, LLMProvider, LLMResponse, ProviderUnavailableError
+from .base import (
+    EmptyCompletionError,
+    LLMMessage,
+    LLMProvider,
+    LLMResponse,
+    ProviderUnavailableError,
+)
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 
@@ -104,13 +110,24 @@ class OpenAICompatibleProvider(LLMProvider):
             raise ProviderUnavailableError(self.name, f"响应结构不符合预期: {exc}") from exc
 
         usage = data.get("usage") or {}
+        # 推理型模型把思考 token 单列在 completion_tokens_details 里，
+        # 但它已计入 completion_tokens，故 total 不会重复计算。
+        completion_details = usage.get("completion_tokens_details") or {}
+        reasoning_tokens = int(completion_details.get("reasoning_tokens") or 0)
+        finish_reason = choice.get("finish_reason")
+
+        if not content.strip():
+            # 空内容绝不静默返回——推理型模型在额度不足时会走到这里。
+            raise EmptyCompletionError(self.name, finish_reason, reasoning_tokens)
+
         return LLMResponse(
             content=content,
             provider=self.name,
             model=data.get("model") or self.model,
             input_tokens=int(usage.get("prompt_tokens") or 0),
             output_tokens=int(usage.get("completion_tokens") or 0),
-            finish_reason=choice.get("finish_reason"),
+            finish_reason=finish_reason,
+            reasoning_tokens=reasoning_tokens,
         )
 
     @staticmethod

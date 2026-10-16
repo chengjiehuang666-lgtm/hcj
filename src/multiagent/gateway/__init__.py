@@ -10,6 +10,7 @@
 
 from .base import (
     AllProvidersFailedError,
+    EmptyCompletionError,
     GatewayError,
     LLMMessage,
     LLMProvider,
@@ -31,6 +32,7 @@ __all__ = [
     "MessageRole",
     "GatewayError",
     "ProviderUnavailableError",
+    "EmptyCompletionError",
     "AllProvidersFailedError",
     "StubProvider",
     "OpenAICompatibleProvider",

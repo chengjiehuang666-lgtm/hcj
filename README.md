@@ -69,6 +69,20 @@ dism /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all
    （通义千问 / 智谱 GLM，均为 OpenAI 兼容接口，只需改 `.env` 三行）。
    同端点下可退而求其次把备用设为 `deepseek-v4-pro`，至少能规避单模型级的容量问题。
 2. **无远端仓库**：回档能力目前仅限本机（见《实施路线图》风险 R12）。
+3. **主力模型是推理型，`max_tokens` 必须留足**：`deepseek-flash` 会先产生
+   `reasoning_content` 再产生 `content`，而 `max_tokens` **由两者共享**。额度偏小时
+   思考会吃掉全部额度，导致 `content` 为空且 `finish_reason=length`。
+
+   网关对此**显式报错**（`EmptyCompletionError`，错误信息提示调大 `max_tokens`），
+   不会静默返回空字符串——静默失败会让上游误以为模型「没话说」。
+
+   实测同一句「只回复两个字：正常」：`max_tokens=20` 时 20 个 token 全被思考消耗、
+   输出为空；`max_tokens=512` 时思考 106 tokens 后正常返回。
+
+   > **成本含义**：推理型模型每次调用的 token 消耗与延迟都显著高于普通模型。
+   > 按《系统架构设计》2.2.4 的「分级路由」策略，简单的分类/抽取步骤应改用小模型，
+   > 只有规划与归因推理才走推理型模型。`LLMResponse.reasoning_tokens` 已单独记录，
+   > 供 W10 的成本计量使用。
 
 ## 快速开始
 
