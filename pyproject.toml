@@ -1,0 +1,45 @@
+[project]
+name = "multiagent"
+version = "0.1.0"
+description = "企业级多 Agent 智能协作平台"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "httpx>=0.27",
+    "psycopg[binary]>=3.2",
+    "redis>=5.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# 编排内核，阶段一 W2 才需要（LangGraph）
+agents = [
+    "langgraph>=0.2",
+]
+dev = [
+    "pytest>=8.0",
+    "jsonschema>=4.23",
+    "ruff>=0.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/multiagent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

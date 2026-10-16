@@ -1,0 +1,46 @@
+name: multiagent
+
+# 说明：本文件只起 PostgreSQL(pgvector) 与 Redis 两个依赖服务。
+# 应用自身在开发阶段直接跑在宿主机（uvicorn --reload），便于热重载与调试；
+# 容器化应用镜像留到阶段三（W12 部署脚本）再做。
+#
+# 注意：本机当前未安装 Docker（见 README「环境前置条件」），
+# 需先在 WSL2 Ubuntu 内安装 Docker Engine，或安装 Docker Desktop，方可使用本文件。
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: ma-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: multiagent
+      POSTGRES_PASSWORD: multiagent
+      POSTGRES_DB: multiagent
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U multiagent -d multiagent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: ma-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
+  redisdata:
