@@ -114,10 +114,24 @@ class PipelineOutcome:
 
 
 class AnalysisPipeline:
-    """把用户需求跑成分析报告的串行链路。"""
+    """把用户需求跑成分析报告的串行链路。
 
-    def __init__(self, settings: Settings) -> None:
+    `on_event` 是可选的事件回调（async），用于向外部（如 SSE 接口）推送节点级进度。
+    **事件通道故障不得影响主流程**，故回调异常一律吞掉——进度是观测手段，
+    不是业务本身。
+    """
+
+    def __init__(self, settings: Settings, on_event=None) -> None:
         self.settings = settings
+        self._on_event = on_event
+
+    async def _emit(self, event: str, **payload: Any) -> None:
+        if self._on_event is None:
+            return
+        try:
+            await self._on_event(event, payload)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ 图构建
     def _make_invocation(
@@ -187,6 +201,7 @@ class AnalysisPipeline:
         async def plan_node(state: PipelineState) -> dict:
             task_id = state["task_event"]["task_id"]
             question = state["task_event"]["payload"]["text"]
+            await self._emit("node_started", node_id="planner_1", agent_role="planner")
             schema = ctx.sandbox.schema_as_prompt_text()
             inv = self._make_invocation(
                 "planner_1",
@@ -195,11 +210,21 @@ class AnalysisPipeline:
                 task_id=task_id,
             )
             result = await planner.invoke(inv, ctx)
-            return self._absorb(state, inv, result)
+            merged = self._absorb(state, inv, result)
+            await self._emit(
+                "node_finished",
+                node_id="planner_1",
+                agent_role="planner",
+                status=result.status.value,
+                duration_ms=result.duration_ms,
+                tokens=result.tokens_used.total,
+            )
+            return merged
 
         async def retrieve_node(state: PipelineState) -> dict:
             task_id = state["task_event"]["task_id"]
             question = state["task_event"]["payload"]["text"]
+            await self._emit("node_started", node_id="retriever_1", agent_role="retriever")
             inv = self._make_invocation(
                 "retriever_1",
                 "retriever",
@@ -207,11 +232,22 @@ class AnalysisPipeline:
                 task_id=task_id,
             )
             result = await retriever.invoke(inv, ctx)
-            return self._absorb(state, inv, result)
+            merged = self._absorb(state, inv, result)
+            await self._emit(
+                "node_finished",
+                node_id="retriever_1",
+                agent_role="retriever",
+                status=result.status.value,
+                duration_ms=result.duration_ms,
+                tokens=result.tokens_used.total,
+                knowledge_count=result.outputs.get("knowledge_count", 0),
+            )
+            return merged
 
         async def analyze_node(state: PipelineState) -> dict:
             task_id = state["task_event"]["task_id"]
             question = state["task_event"]["payload"]["text"]
+            await self._emit("node_started", node_id="analyst_1", agent_role="analyst")
             # 把 Planner 为该节点写的验收标准传给取数环节：
             # 否则「写 SQL 的一步」不知道「下结论的一步」需要哪些维度和基期数据。
             acceptance = [
@@ -235,7 +271,17 @@ class AnalysisPipeline:
                 task_id=task_id,
             )
             result = await analyst.invoke(inv, ctx)
-            return self._absorb(state, inv, result)
+            merged = self._absorb(state, inv, result)
+            await self._emit(
+                "node_finished",
+                node_id="analyst_1",
+                agent_role="analyst",
+                status=result.status.value,
+                duration_ms=result.duration_ms,
+                tokens=result.tokens_used.total,
+                sql_attempts=result.outputs.get("sql_attempts"),
+            )
+            return merged
 
         builder = StateGraph(PipelineState)
         builder.add_node("plan", plan_node)

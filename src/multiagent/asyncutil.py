@@ -9,8 +9,11 @@
 不要在业务代码里直接调用 `asyncio.run()`。已由
 `tests/test_async_loop_compat.py` 守护。
 
-**FastAPI/uvicorn 用法**：uvicorn 自己管理事件循环，因此需要在**启动 uvicorn 之前**
-调用 `install_event_loop_policy()`，例如放在应用入口模块的顶部。
+**FastAPI/uvicorn 用法**：⚠️ **`install_event_loop_policy()` 对 uvicorn 无效**——
+uvicorn 0.54 在 Windows 上硬编码使用 ProactorEventLoop，并把它自己的 loop factory
+交给 `asyncio.Runner`，提前设置全局策略不会生效。正确做法是覆盖 uvicorn 的 loop 工厂，
+见 `api/__main__.py`（传 `loop="asyncio:SelectorEventLoop"`）。
+本函数仅适用于**自行调用 `asyncio.run()`** 的入口。
 """
 
 from __future__ import annotations
