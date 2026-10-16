@@ -40,6 +40,8 @@ TIER_FAST = "fast"
 ROUTE_PLANNER = "planner"
 ROUTE_ANALYST_SQL = "analyst_sql"
 ROUTE_ANALYST_CONCLUDE = "analyst_conclude"
+ROUTE_REVIEWER = "reviewer"
+ROUTE_WRITER = "writer"
 ROUTE_DEFAULT = "default"
 
 #: 代码中真实存在的调用点。新建调用点时请一并登记，便于发现漏配。
@@ -47,6 +49,8 @@ KNOWN_ROUTES: tuple[str, ...] = (
     ROUTE_PLANNER,
     ROUTE_ANALYST_SQL,
     ROUTE_ANALYST_CONCLUDE,
+    ROUTE_REVIEWER,
+    ROUTE_WRITER,
 )
 
 

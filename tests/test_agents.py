@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import pathlib
 import sys
+from datetime import datetime, timedelta, timezone
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -20,6 +21,8 @@ from multiagent.contracts import (  # noqa: E402
     AgentError,
     AgentInvocation,
     AgentResult,
+    BlackboardEntry,
+    EntryStatus,
     InvocationBudget,
     ResultStatus,
 )
@@ -281,9 +284,15 @@ def test_absorb_returns_only_this_node_delta() -> None:
     assert delta["node_outputs"] == {"retriever_2": ok.outputs}
     assert list(delta["blackboard"]) == ["retriever_2.metrics"]
     entry = delta["blackboard"]["retriever_2.metrics"]
-    assert entry["version"] == 1
+    # 条目必须过冻结契约的校验，不是「形状相近的 dict」
+    parsed = BlackboardEntry.model_validate(entry)
+    assert parsed.version == 1
+    assert parsed.status is EntryStatus.draft
+    assert parsed.task_id == inv.task_id
     # 用真实 Agent 版本，不再写死 0.1.0（原先写死的是潜伏 bug）
-    assert entry["written_by"] == "retriever@0.3.0"
+    assert parsed.written_by.agent_version == "0.3.0"
+    assert parsed.written_by.node_id == "retriever_2"
+    assert parsed.written_by.attempt == 1
     # 角色要写进 node_results，下游才能按 role 取值而不依赖可变的 node_id
     assert delta["node_results"][0]["agent_role"] == "retriever"
 
@@ -304,8 +313,10 @@ def test_absorb_does_not_leak_previous_state() -> None:
         sources=[{"type": "document", "ref": "知识库:x#0"}],
         blackboard_writes=["retriever_1.knowledge"],
     )
-    first = AnalysisPipeline._absorb(inv, ok, RetrieverAgent())
-    second = AnalysisPipeline._absorb(inv, ok, RetrieverAgent())
+    # 固定写入时间，否则两次调用的 written_at 不同，测的就不是「无状态泄漏」
+    fixed = datetime(2026, 10, 16, 12, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+    first = AnalysisPipeline._absorb(inv, ok, RetrieverAgent(), written_at=fixed)
+    second = AnalysisPipeline._absorb(inv, ok, RetrieverAgent(), written_at=fixed)
     assert first == second
 
 

@@ -74,6 +74,8 @@ class Settings(BaseSettings):
             "planner": "reasoning",
             "analyst_sql": "reasoning",
             "analyst_conclude": "reasoning",
+            "reviewer": "reasoning",
+            "writer": "reasoning",
         }
     )
 
@@ -105,7 +107,7 @@ class Settings(BaseSettings):
     # checkpoints / checkpoint_blobs / checkpoint_writes / checkpoint_migrations 四张表；
     # 把它们喂给模型既是噪音（占表结构提示词约 70% 的字符），也可能诱导模型去查框架表。
     schema_exclude_table_prefixes: list[str] = Field(
-        default_factory=lambda: ["checkpoint", "langgraph", "pg_", "sql_"]
+        default_factory=lambda: ["checkpoint", "langgraph", "pg_", "sql_", "memory"]
     )
 
     # ---- 知识库 / RAG ----
@@ -124,9 +126,20 @@ class Settings(BaseSettings):
     # 混合检索里向量分的权重，其余给关键词（pg_trgm）分
     rag_vector_weight: float = 0.7
 
+    # ---- 长期记忆（W6）----
+    #: 是否把「任务成功 + 评审未否决」的结论自动沉淀进长期记忆。
+    #: 沉淀是 best-effort：失败只记录错误，不影响任务本身。
+    memory_sink_enabled: bool = True
+    #: 记忆检索条数上限（混合加权与知识库同一套公式与权重）
+    memory_top_k: int = 3
+
     # ---- 执行预算默认值（对应契约 TaskEvent.budget）----
     default_max_steps: int = 30
-    default_max_tokens: int = 200_000  # 待评测集校准，见《实施路线图》待定项 D2
+    # 任务级 Token 熔断阈值，即《实施路线图》待定项 D2。
+    # 定值规则：评测实测最大 × 1.5 安全系数、向上取整到万。
+    #   W4（无 reviewer）：最大 20,550 → 40,000
+    #   W6（含 reviewer）：最大 33,842 → 60,000（实测见路线图 §3.11）
+    default_max_tokens: int = 60_000
     default_max_retries: int = 2
     default_task_timeout_seconds: int = 300
 

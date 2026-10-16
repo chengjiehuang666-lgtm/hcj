@@ -54,7 +54,7 @@ def _default_pipeline_factory(settings: Settings, on_event) -> AnalysisPipeline:
 def _outcome_to_result(outcome: PipelineOutcome) -> dict[str, Any]:
     # 按 agent_role 取值：动态 DAG 下 node_id 可变，写死 "analyst_1" 会取不到
     outputs = outcome.merged_outputs_for_role("analyst")
-    return {
+    result: dict[str, Any] = {
         "status": outcome.status,
         "summary": outcome.summary,
         "key_findings": outputs.get("key_findings", []),
@@ -77,6 +77,24 @@ def _outcome_to_result(outcome: PipelineOutcome) -> dict[str, Any]:
             for r in outcome.node_results
         ],
     }
+    # 评审结论单独暴露（有 reviewer 节点时）：verdict 是「能不能采信」的答案
+    review = outcome.merged_outputs_for_role("reviewer")
+    if review:
+        result["review"] = {
+            "verdict": review.get("verdict"),
+            "issue_count": review.get("issue_count"),
+            "issues": review.get("issues", []),
+            "checks": review.get("checks", []),
+        }
+    # 文档场景（第 2 场景）的产物：写作节点产出的是文档本体，不是摘要
+    document = outcome.merged_outputs_for_role("writer")
+    if document:
+        result["document"] = {
+            "title": document.get("title"),
+            "markdown": document.get("document_markdown"),
+            "material_gaps": document.get("material_gaps", []),
+        }
+    return result
 
 
 async def _probe_dependencies(settings: Settings) -> dict[str, Any]:

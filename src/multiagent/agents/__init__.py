@@ -11,6 +11,8 @@ from .analyst import AnalystAgent
 from .base import AgentContext, AgentOutputError, BaseAgent
 from .planner import PlannerAgent
 from .retriever import RetrieverAgent
+from .reviewer import ReviewerAgent
+from .writer import WriterAgent
 
 __all__ = [
     "BaseAgent",
@@ -19,6 +21,8 @@ __all__ = [
     "PlannerAgent",
     "RetrieverAgent",
     "AnalystAgent",
+    "ReviewerAgent",
+    "WriterAgent",
     "build_agent_registry",
 ]
 
@@ -35,5 +39,11 @@ def build_agent_registry() -> dict[str, BaseAgent]:
     在图之外先运行；传给 Planner 的 `available_roles` 会把它自己排除掉，
     避免它规划出 planner 节点。
     """
-    agents: list[BaseAgent] = [PlannerAgent(), RetrieverAgent(), AnalystAgent()]
+    agents: list[BaseAgent] = [
+        PlannerAgent(),
+        RetrieverAgent(),
+        AnalystAgent(),
+        ReviewerAgent(),
+        WriterAgent(),
+    ]
     return {agent.role: agent for agent in agents}

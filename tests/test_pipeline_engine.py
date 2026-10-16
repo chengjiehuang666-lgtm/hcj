@@ -56,10 +56,14 @@ class RecordingAgent(BaseAgent):
         self._delay = delay
         self.intervals: dict[str, tuple[float, float]] = {}
         self.inputs: dict[str, dict] = {}
+        self.visible_keys: dict[str, list[str]] = {}
+        self.calls: dict[str, int] = {}
 
     async def invoke(self, inv: AgentInvocation, ctx: AgentContext) -> AgentResult:
         started = time.perf_counter()
         self.inputs[inv.node_id] = dict(inv.input)
+        self.visible_keys[inv.node_id] = list(inv.visible_blackboard_keys)
+        self.calls[inv.node_id] = self.calls.get(inv.node_id, 0) + 1
         await asyncio.sleep(self._delay)
         ended = time.perf_counter()
         self.intervals[inv.node_id] = (started, ended)
@@ -336,3 +340,88 @@ def test_multi_sink_graph_executes_both_branches() -> None:
     agents = {r: RecordingAgent(r) for r in ("retriever", "analyst", "reviewer")}
     final = asyncio.run(_run(dag, agents))
     assert {r["node_id"] for r in final["node_results"]} == _all_nodes(dag)
+
+
+# ------------------------------------------------------------------ 黑板订阅
+
+
+def test_join_waits_for_all_dependencies_and_runs_once() -> None:
+    """依赖横跨两层时，下游必须等**全部**上游完成，且只执行一次。
+
+    回归 W6 抓到的引擎缺陷：逐个 add_edge(dep, node) 在 LangGraph 里是
+    「任一上游完成即触发」——reviewer_1 曾在 analyst_1 完成前就提前跑了一次，
+    之后又跑第二次。修复是改用列表形式连边（join 语义）。
+    """
+    dag = _dag(
+        [
+            _node("retriever_1", "retriever"),
+            _node("retriever_2", "retriever"),
+            _node("analyst_1", "analyst", ["retriever_1"]),
+            _node("reviewer_1", "reviewer", ["retriever_1", "retriever_2", "analyst_1"]),
+        ]
+    )
+    agents = {r: RecordingAgent(r) for r in ("retriever", "analyst", "reviewer")}
+    final = asyncio.run(_run(dag, agents))
+
+    assert agents["reviewer"].calls["reviewer_1"] == 1, "下游不得提前执行或重复执行"
+    # 唯一一次执行时，三个上游的条目全部可见
+    assert set(agents["reviewer"].inputs["reviewer_1"]["blackboard"]) == {
+        "retriever_1.out",
+        "retriever_2.out",
+        "analyst_1.out",
+    }
+    # node_results 里也不得出现重复节点（重复即意味着跑了不止一次）
+    ids = [r["node_id"] for r in final["node_results"]]
+    assert len(ids) == len(set(ids))
+
+
+def test_blackboard_entries_are_contract_conformant_in_state() -> None:
+    """图跑完后，state 里的黑板条目必须能被冻结契约解析（并行路径也一样）。"""
+    from multiagent.contracts import BlackboardEntry
+
+    dag = _dag(
+        [
+            _node("retriever_1", "retriever"),
+            _node("retriever_2", "retriever"),
+            _node("analyst_1", "analyst", ["retriever_1", "retriever_2"]),
+        ]
+    )
+    agents = {"retriever": RecordingAgent("retriever"), "analyst": RecordingAgent("analyst")}
+    final = asyncio.run(_run(dag, agents))
+
+    for key, entry in final["blackboard"].items():
+        parsed = BlackboardEntry.model_validate(entry)
+        assert parsed.key == key
+        assert parsed.version == 1
+        assert parsed.written_by.node_id == key.split(".", 1)[0]
+
+
+def test_downstream_sees_upstream_blackboard_and_visible_keys() -> None:
+    """订阅语义：下游只拿到**直接上游**的条目，且可见性字段被真实填充。"""
+    dag = _dag(
+        [
+            _node("retriever_1", "retriever"),
+            _node("retriever_2", "retriever"),
+            _node("analyst_1", "analyst", ["retriever_1"]),
+            _node("reviewer_1", "reviewer", ["retriever_1", "retriever_2", "analyst_1"]),
+        ]
+    )
+    agents = {
+        r: RecordingAgent(r) for r in ("retriever", "analyst", "reviewer")
+    }
+    asyncio.run(_run(dag, agents))
+
+    # analyst 只依赖 retriever_1：看不到 retriever_2 的条目
+    analyst_input = agents["analyst"].inputs["analyst_1"]
+    assert set(analyst_input["blackboard"]) == {"retriever_1.out"}
+    assert agents["analyst"].visible_keys["analyst_1"] == ["retriever_1.out"]
+
+    # reviewer 依赖全部三个：三条条目都可见，且能看到来源明细
+    reviewer_input = agents["reviewer"].inputs["reviewer_1"]
+    assert set(reviewer_input["blackboard"]) == {
+        "retriever_1.out",
+        "retriever_2.out",
+        "analyst_1.out",
+    }
+    assert agents["reviewer"].visible_keys["reviewer_1"] == sorted(reviewer_input["blackboard"])
+    assert reviewer_input["upstream_sources"]["analyst_1"][0]["type"] == "model_inference"

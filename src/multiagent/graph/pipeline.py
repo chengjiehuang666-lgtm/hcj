@@ -24,6 +24,7 @@ Planner 的策略，两者分开——引擎的通用性由 `tests/test_pipeline
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -34,14 +35,19 @@ from langgraph.graph import END, START, StateGraph
 
 from ..agents import AgentContext, BaseAgent, build_agent_registry
 from ..config import Settings
+from ..memory import MemoryStore
 from ..contracts import (
     AgentInvocation,
     AgentResult,
+    BlackboardEntry,
+    EntryStatus,
     InvocationBudget,
     ResultStatus,
+    SourceRef,
     SubtaskDAG,
     SubtaskNode,
     TaskEvent,
+    WrittenBy,
     to_wire,
 )
 from ..gateway import build_router_from_settings
@@ -119,6 +125,9 @@ class PipelineOutcome:
     #: 逐次模型调用明细（按发生顺序）。供分级路由的成本/时延归因与 W10 成本计量使用。
     #: 注意：这是**内部结构**，不属于任何已冻结的契约。
     call_records: list[dict[str, Any]] = field(default_factory=list)
+    #: 本次任务沉淀进长期记忆的条目 id（未沉淀为 None）；沉淀失败时 error 记录原因
+    memory_sunk: int | None = None
+    memory_error: str | None = None
 
     def outputs_for_role(self, role: str) -> list[dict[str, Any]]:
         """按 agent_role 取该角色所有节点的 outputs（按发生顺序，结果稳定）。
@@ -225,6 +234,7 @@ class AnalysisPipeline:
         *,
         task_id: str,
         attempt: int = 1,
+        visible_blackboard_keys: list[str] | None = None,
     ) -> AgentInvocation:
         return AgentInvocation(
             task_id=task_id,
@@ -237,6 +247,7 @@ class AnalysisPipeline:
                 max_tokens=self.settings.default_max_tokens,
                 timeout_seconds=self.settings.default_task_timeout_seconds,
             ),
+            visible_blackboard_keys=list(visible_blackboard_keys or []),
         )
 
     @staticmethod
@@ -246,10 +257,28 @@ class AnalysisPipeline:
         采用「上游产物按 key 合并」而不是让 Planner 写死数据流接线，是为了让
         Planner 只关心「做什么」，不必关心「数据怎么传」。上游 key 互不重叠时
         合并是安全的；即便重叠，黑板里的 `<node_id>.<output>` 仍保留完整出处。
+
+        除产物外，还交付两样**订阅内容**：
+        - `blackboard`：直接上游写入的黑板条目（含 version/status/sources）——
+          核验型节点（reviewer）要按条目核对证据与版本，光有产物不够；
+        - `upstream_sources`：按上游节点分组的来源明细。
         """
         merged: dict[str, Any] = {}
         for dep in node.depends_on:
             merged.update(state.get("node_outputs", {}).get(dep, {}))
+
+        deps = set(node.depends_on)
+        visible = {
+            key: entry
+            for key, entry in (state.get("blackboard") or {}).items()
+            # 黑板 key 的命名约定是 <node_id>.<output>（契约正则亦如此）
+            if key.split(".", 1)[0] in deps
+        }
+        upstream_sources = {
+            r.get("node_id"): r.get("sources", [])
+            for r in (state.get("node_results") or [])
+            if r.get("node_id") in deps
+        }
 
         return {
             **merged,
@@ -260,14 +289,122 @@ class AnalysisPipeline:
             "acceptance": list(node.acceptance),
             "node_id": node.node_id,
             "upstream_nodes": list(node.depends_on),
+            "blackboard": visible,
+            "upstream_sources": upstream_sources,
         }
 
     @staticmethod
-    def _absorb(inv: AgentInvocation, result: AgentResult, agent: BaseAgent) -> dict:
+    def _new_entry(
+        key: str,
+        inv: AgentInvocation,
+        result: AgentResult,
+        agent: BaseAgent,
+        written_at: datetime,
+    ) -> BlackboardEntry:
+        """构造契约化黑板条目（`BlackboardEntry`），首次写入版本号为 1。"""
+        return BlackboardEntry(
+            task_id=inv.task_id,
+            key=key,
+            version=1,
+            payload=result.outputs,
+            written_by=WrittenBy(
+                agent_role=inv.agent_role,
+                agent_version=agent.version,
+                node_id=inv.node_id,
+                attempt=inv.attempt,
+            ),
+            written_at=written_at,
+            # 新写入一律 draft：经 Reviewer 核验后才流转为 validated（见契约 status 语义）
+            status=EntryStatus.draft,
+            sources=[
+                SourceRef.model_validate(s) for s in (to_wire(result).get("sources") or [])
+            ],
+            confidence=result.confidence,
+        )
+
+    @staticmethod
+    def _apply_blackboard_updates(
+        current: dict[str, Any],
+        updates: list[Any],
+        inv: AgentInvocation,
+        agent: BaseAgent,
+    ) -> dict[str, dict[str, Any]]:
+        """对既有条目做**乐观锁更新**——契约语义：提交读到的 version，比对不符即拒绝。
+
+        更新意图由 Agent 在 outputs 的保留键 `blackboard_updates` 声明：
+            [{"key": "analyst_1.report", "expected_version": 1, "status": "validated"}]
+        拒绝而不静默覆盖：状态流转（draft → validated/rejected）是
+        「产物经 Reviewer 抽检」的落点，让它悄悄错版等于废掉审核语义。
+        """
+        applied: dict[str, dict[str, Any]] = {}
+        for item in updates:
+            if not isinstance(item, dict) or "key" not in item or "expected_version" not in item:
+                raise PipelineNodeFailed(
+                    node_id=inv.node_id,
+                    code="BAD_BLACKBOARD_UPDATE",
+                    message=f"blackboard_updates 元素形状非法: {item!r:.200}",
+                    retryable=False,
+                )
+            key = str(item["key"])
+            raw = current.get(key)
+            if raw is None:
+                raise PipelineNodeFailed(
+                    node_id=inv.node_id,
+                    code="BLACKBOARD_CONFLICT",
+                    message=f"更新了不存在的黑板条目 {key}",
+                    retryable=False,
+                )
+            entry = BlackboardEntry.model_validate(raw)
+            expected = int(item["expected_version"])
+            if entry.version != expected:
+                raise PipelineNodeFailed(
+                    node_id=inv.node_id,
+                    code="BLACKBOARD_CONFLICT",
+                    message=(
+                        f"条目 {key} 版本冲突：写入方读到 v{expected}，当前 v{entry.version}；"
+                        "写入被拒绝（乐观锁）"
+                    ),
+                    retryable=True,
+                )
+            try:
+                new_status = EntryStatus(str(item["status"]))
+            except ValueError as exc:
+                raise PipelineNodeFailed(
+                    node_id=inv.node_id,
+                    code="BAD_BLACKBOARD_UPDATE",
+                    message=f"非法条目状态 {item['status']!r}：{exc}",
+                    retryable=False,
+                ) from exc
+            updated = entry.next_version(
+                entry.payload,
+                status=new_status,
+                written_by=WrittenBy(
+                    agent_role=inv.agent_role,
+                    agent_version=agent.version,
+                    node_id=inv.node_id,
+                    attempt=inv.attempt,
+                ),
+                written_at=datetime.now(TZ_CN),
+            )
+            applied[key] = updated.model_dump(mode="json")
+        return applied
+
+    @staticmethod
+    def _absorb(
+        inv: AgentInvocation,
+        result: AgentResult,
+        agent: BaseAgent,
+        *,
+        blackboard: dict[str, Any] | None = None,
+        written_at: datetime | None = None,
+    ) -> dict:
         """把节点结果转成**状态增量**；失败则中止。
 
         只返回本节点的增量（不读旧状态、不做全量覆盖），这样 reducer 才能安全
         合并并行节点的写入。
+
+        黑板条目按**冻结契约** `BlackboardEntry` 构造，不再手写近似 dict——
+        条目是「结论可回溯」的落点，形状漂移会让契约校验形同虚设。
         """
         if result.status is not ResultStatus.ok:
             err = result.error
@@ -284,16 +421,33 @@ class AnalysisPipeline:
             # 不必依赖运行时可变的 node_id。node_results 是内部结构，可自由扩展。
             "agent_role": inv.agent_role,
         }
-        entry = {
-            "version": 1,
-            "written_by": agent.labeled_version,  # 用真实 Agent 版本，不再写死
-            "confidence": result.confidence,
-            "payload": result.outputs,
-            "sources": wire.get("sources", []),
-        }
+        current = blackboard or {}
+        written_at = written_at or datetime.now(TZ_CN)
+        entries: dict[str, dict[str, Any]] = {}
+        for key in result.blackboard_writes:
+            if key in current:
+                raise PipelineNodeFailed(
+                    node_id=inv.node_id,
+                    code="BLACKBOARD_CONFLICT",
+                    message=(
+                        f"键 {key} 已存在（v{current[key].get('version')}）；"
+                        "覆盖既有条目必须走 blackboard_updates（乐观锁）"
+                    ),
+                    retryable=False,
+                )
+            entries[key] = AnalysisPipeline._new_entry(
+                key, inv, result, agent, written_at
+            ).model_dump(mode="json")
+
+        updates = (result.outputs or {}).get("blackboard_updates") or []
+        if updates:
+            entries.update(
+                AnalysisPipeline._apply_blackboard_updates(current, updates, inv, agent)
+            )
+
         return {
             "node_outputs": {inv.node_id: result.outputs},
-            "blackboard": {key: entry for key in result.blackboard_writes},
+            "blackboard": entries,
             "node_results": [wire],
         }
 
@@ -310,14 +464,30 @@ class AnalysisPipeline:
             await self._emit(
                 "node_started", node_id=node.node_id, agent_role=node.agent_role.value
             )
+            inputs = self._build_node_input(node, state)
             inv = self._make_invocation(
                 node.node_id,
                 node.agent_role.value,
-                self._build_node_input(node, state),
+                inputs,
                 task_id=task_id,
+                # 契约字段落到实处：本节点能读到的黑板条目 = 直接上游写入的那些
+                visible_blackboard_keys=sorted(inputs.get("blackboard") or {}),
             )
             result = await agent.invoke(inv, ctx)
-            delta = self._absorb(inv, result, agent)
+            delta = self._absorb(
+                inv, result, agent, blackboard=state.get("blackboard") or {}
+            )
+            for key, entry in delta.get("blackboard", {}).items():
+                # 黑板变更通知走进程内事件通道（= SSE）；跨进程订阅属多进程阶段
+                await self._emit(
+                    "blackboard_written",
+                    key=key,
+                    version=entry.get("version"),
+                    status=entry.get("status"),
+                    written_by=entry.get("written_by"),
+                    node_id=node.node_id,
+                    agent_role=node.agent_role.value,
+                )
             await self._emit(
                 "node_finished",
                 node_id=node.node_id,
@@ -351,8 +521,11 @@ class AnalysisPipeline:
             builder.add_node(node.node_id, self._make_node_fn(ctx, node))
         for node in dag.nodes:
             if node.depends_on:
-                for dep in node.depends_on:
-                    builder.add_edge(dep, node.node_id)
+                # 必须用**列表形式**连边（join 语义）。逐个 add_edge(dep, node) 是
+                # 「任一上游完成即触发」：依赖跨层时下游会提前执行一次、依赖齐了再跑一次。
+                # 这是 W6 被黑板冲突检测抓到的 W5 引擎缺陷（菱形用例的两路恰好同一步完成，
+                # 掩盖了它；只有依赖横跨两层时才现形）。
+                builder.add_edge(list(node.depends_on), node.node_id)
             else:
                 builder.add_edge(START, node.node_id)
         for sink in sink_node_ids(dag.model_dump(mode="json")):
@@ -445,7 +618,28 @@ class AnalysisPipeline:
         if unmapped := getattr(router, "unmapped_routes", None):
             # 路由表漏配不是致命错误（会退回默认档），但必须能被发现
             outcome.error = f"路由表未配置的调用点: {sorted(unmapped)}"
+        # 结论沉淀（best-effort）：门槛见 memory.distill_memory（任务成功 + 评审未否决）。
+        # 失败只记录不抛出——记忆是增强，不是任务成功的必要条件。
+        if self.settings.memory_sink_enabled and outcome.status == "ok":
+            await self._sink_memory(outcome)
         return outcome
+
+    async def _sink_memory(self, outcome: PipelineOutcome) -> None:
+        try:
+            memory_id = await asyncio.to_thread(
+                lambda: MemoryStore(self.settings).sink_outcome(outcome)
+            )
+        except Exception as exc:
+            outcome.memory_error = f"{type(exc).__name__}: {exc}"[:300]
+            await self._emit(
+                "memory_sink_failed", task_id=outcome.task_id, error=outcome.memory_error
+            )
+            return
+        if memory_id is not None:
+            outcome.memory_sunk = memory_id
+            await self._emit(
+                "memory_sunk", task_id=outcome.task_id, memory_id=memory_id
+            )
 
     async def _plan(
         self, ctx: AgentContext, event: TaskEvent, task_id: str
@@ -471,7 +665,8 @@ class AnalysisPipeline:
             task_id=task_id,
         )
         result = await planner.invoke(inv, ctx)
-        delta = self._absorb(inv, result, planner)  # 失败会抛 PipelineNodeFailed
+        # 失败会抛 PipelineNodeFailed；Planner 在黑板书之前，current 传空
+        delta = self._absorb(inv, result, planner, blackboard={})
         await self._emit(
             "node_finished",
             node_id=PLANNER_NODE_ID,

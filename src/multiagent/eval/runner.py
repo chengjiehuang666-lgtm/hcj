@@ -78,6 +78,11 @@ class CaseResult:
     #: 检索阶段实际取到的知识文档与片段数——RAG 回归的结构性证据
     retrieved_docs: list[str] = field(default_factory=list)
     knowledge_count: int = 0
+    #: 评审结论（verdict 与问题数）——reviewer 的可观测出口
+    review_verdict: str | None = None
+    review_issues: int | None = None
+    #: 检索阶段实际取到的长期记忆条数——记忆回归的结构性证据
+    memory_count: int = 0
 
 
 def _nodes_by_role(outcome, role: str) -> list[dict]:
@@ -112,6 +117,34 @@ def _retrieved_docs(outcome) -> list[str]:
     return docs
 
 
+def _retrieved_memories(outcome) -> list[str]:
+    """汇总所有 retriever 节点取到的长期记忆内容（结构性命中证据）。"""
+    texts: list[str] = []
+    for res in _nodes_by_role(outcome, "retriever"):
+        for item in (res.get("outputs") or {}).get("memories", []) or []:
+            texts.append(str(item.get("content", "")))
+    return texts
+
+
+def _writer_outputs(outcome) -> dict:
+    """写作节点的产物（多节点时按顺序合并）。"""
+    merged: dict = {}
+    for res in _nodes_by_role(outcome, "writer"):
+        merged.update(res.get("outputs") or {})
+    return merged
+
+
+def _review_summary(outcome) -> tuple[str | None, int | None]:
+    """取 reviewer 节点的 verdict 与问题数（无 reviewer 节点时返回 None）。"""
+    reviews = _nodes_by_role(outcome, "reviewer")
+    if not reviews:
+        return None, None
+    outputs: dict = {}
+    for res in reviews:
+        outputs.update(res.get("outputs") or {})
+    return outputs.get("verdict"), outputs.get("issue_count")
+
+
 def grade(case: EvalCase, outcome) -> tuple[bool, list[str], list[str], bool]:
     """返回 (是否通过, 未命中的检查项, 命中的禁用词, 是否判定数据不足)。"""
     outputs = _analyst_outputs(outcome)
@@ -122,6 +155,8 @@ def grade(case: EvalCase, outcome) -> tuple[bool, list[str], list[str], bool]:
             [
                 outcome.summary or "",
                 " ".join(outputs.get("key_findings", []) or []),
+                # 文档场景：产物本体是文档正文，断言必须能落在它上面
+                str(_writer_outputs(outcome).get("document_markdown") or "")[:3000],
             ]
         )
     )
@@ -137,6 +172,14 @@ def grade(case: EvalCase, outcome) -> tuple[bool, list[str], list[str], bool]:
             if not any(_matches(text, alt) for alt in group):
                 failed.append("|".join(group))
 
+    # 角色证据：该能力真的参与了执行（如文档场景必须有 writer 且成功）
+    ok_roles = {
+        r.get("agent_role") for r in outcome.node_results if r.get("status") == "ok"
+    }
+    for role in case.expect_roles:
+        if role not in ok_roles:
+            failed.append(f"缺少角色:{role}")
+
     # RAG 回归：知识必须**真的被检索到**。
     # 只检查答案文本无法区分「模型本来就知道」与「查了知识库」，
     # 因此这里查的是检索结果这一结构性证据。
@@ -145,6 +188,14 @@ def grade(case: EvalCase, outcome) -> tuple[bool, list[str], list[str], bool]:
         failed.append("未检索到任何知识")
     if case.expect_docs and not any(exp in doc for exp in case.expect_docs for doc in docs):
         failed.append("知识库:" + "|".join(case.expect_docs))
+
+    # 记忆回归：与 RAG 同一套方法——只查答案文本区分不出
+    # 「真查了记忆」与「重新跑一遍 SQL 恰好得到相同数字」。
+    memories = _retrieved_memories(outcome)
+    if case.expect_memories and not any(
+        exp in t for exp in case.expect_memories for t in memories
+    ):
+        failed.append("记忆:" + "|".join(case.expect_memories))
 
     hit_forbidden = [w for w in case.forbid if _matches(text, w)]
     return (not failed and not hit_forbidden), failed, hit_forbidden, insufficient
@@ -269,6 +320,8 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
         passed, failed, forbidden, insufficient = grade(case, outcome)
         outputs = _analyst_outputs(outcome)
         docs = _retrieved_docs(outcome)
+        verdict, issue_count = _review_summary(outcome)
+        memories = _retrieved_memories(outcome)
         report.results.append(
             CaseResult(
                 case_id=case.id,
@@ -289,6 +342,9 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
                 route_tokens=outcome.tokens_by_route,
                 retrieved_docs=sorted(set(docs)),
                 knowledge_count=len(docs),
+                review_verdict=verdict,
+                review_issues=issue_count,
+                memory_count=len(memories),
             )
         )
         if passed:
@@ -363,17 +419,21 @@ def render_markdown(report: EvalReport) -> str:
 
     add("## 逐条结果")
     add("")
-    add("| # | 用例 | 结果 | 时延 | Token | 知识 | SQL 行数 | 未命中 |")
-    add("| :-- | :--- | :-- | --: | --: | --: | --: | :--- |")
+    add("| # | 用例 | 结果 | 时延 | Token | 知识 | 记忆 | SQL 行数 | 评审 | 未命中 |")
+    add("| :-- | :--- | :-- | --: | --: | --: | --: | --: | :--- | :--- |")
     for i, r in enumerate(report.results, start=1):
         mark = "✅" if r.passed else "❌"
         detail = r.error or (", ".join(r.failed_checks) if r.failed_checks else "")
         if r.hit_forbidden:
             detail = f"命中禁用词 {r.hit_forbidden}"
+        review = "-"
+        if r.review_verdict:
+            icon = {"pass": "✓", "pass_with_issues": "△"}.get(r.review_verdict, "✗")
+            review = f"{icon}{r.review_verdict}"
         add(
             f"| {i} | `{r.case_id}` | {mark} | {r.latency_ms / 1000:.1f}s | "
-            f"{r.tokens:,} | {r.knowledge_count or '-'} | "
-            f"{r.sql_rows if r.sql_rows is not None else '-'} | {detail} |"
+            f"{r.tokens:,} | {r.knowledge_count or '-'} | {r.memory_count or '-'} | "
+            f"{r.sql_rows if r.sql_rows is not None else '-'} | {review} | {detail} |"
         )
     add("")
 
@@ -398,6 +458,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ids", help="只跑指定用例，逗号分隔")
     parser.add_argument("--limit", type=int, help="只跑前 N 条")
     parser.add_argument("--out", default="eval_results", help="结果输出目录")
+    parser.add_argument(
+        "--no-prereq",
+        action="store_true",
+        help="不自动补齐前置用例（用于记忆回归的「牙齿」演示：清空记忆后单跑消费方用例）",
+    )
     args = parser.parse_args(argv)
 
     ids = [s.strip() for s in args.ids.split(",")] if args.ids else None
@@ -405,6 +470,19 @@ def main(argv: list[str] | None = None) -> int:
     if not cases:
         print("没有匹配的用例")
         return 1
+
+    # 前置用例自动补齐并排到最前：记忆用例依赖产生记忆的分析用例，
+    # 单跑消费方时必须先把前置用例跑掉，否则会以「记忆为空」的假象失败。
+    if not args.no_prereq:
+        selected_ids = {c.id for c in cases}
+        prereqs: list[EvalCase] = []
+        for case in cases:
+            if case.requires_case and case.requires_case not in selected_ids:
+                prereqs.extend(get_cases(ids=[case.requires_case]))
+                selected_ids.add(case.requires_case)
+        if prereqs:
+            cases = prereqs + cases
+            print(f"自动补齐前置用例：{[c.id for c in prereqs]}")
 
     settings = Settings()
     known = {c.id for c in CASES}
@@ -434,6 +512,19 @@ def main(argv: list[str] | None = None) -> int:
                     f"知识库就绪：{stats['documents']} 篇 / {stats['chunks']} 分块"
                     f"（{len(knowledge_cases)} 条用例依赖它）\n"
                 )
+
+    # 记忆用例依赖记忆库里有内容（由前置用例沉淀）；打印现状便于识别「假失败」
+    if any(c.expect_memories or c.requires_case for c in cases):
+        from ..memory import MemoryStore
+
+        try:
+            mem_stats = MemoryStore(settings).stats()
+            print(
+                f"长期记忆：{mem_stats['total']} 条（validated {mem_stats['validated']}）"
+                "——记忆用例依赖前置用例先沉淀\n"
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠ 无法读取长期记忆状态（{exc}）\n")
 
     report = run_cases_sync(settings, cases)
 

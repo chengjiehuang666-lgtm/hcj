@@ -31,6 +31,15 @@ class EvalCase:
     expect_docs: list[str] = field(default_factory=list)
     #: 是否强制要求检索阶段取到了知识（用于纯知识类问题）
     require_knowledge: bool = False
+    #: 必须出现且 status=ok 的节点角色（结构性证据：该能力真的参与了执行）。
+    #: 例如文档场景要求 ["writer", "reviewer"]；分析场景要求 ["reviewer"]。
+    expect_roles: list[str] = field(default_factory=list)
+    #: 期望被检索到的长期记忆内容（子串，命中**任意一个**即可）。
+    #: 同样只查检索结果这一结构性证据，不看答案措辞。
+    expect_memories: list[str] = field(default_factory=list)
+    #: 前置用例：本用例依赖它先执行（如记忆用例依赖产生记忆的分析用例）。
+    #: runner 会自动补齐并把前置用例排到前面；`--no-prereq` 可关闭（用于牙齿演示）。
+    requires_case: str | None = None
     note: str = ""
 
 
@@ -212,6 +221,51 @@ CASES: list[EvalCase] = [
         ],
         expect_docs=["channel-ops", "q2-2026-review", "return-policy"],
         note="需要运营日历知识：9 月本是线上数码高峰，不升反降属异常信号",
+    ),
+    # ---------------------- 文档场景用例（第 2 场景回归） ----------------------
+    # 共同设计原则：**必须由 writer 节点产出文档**，且文档内容只能来自素材。
+    # 抓的是「文档能力被改坏」：writer 没被规划、素材没进提示词、结构缺失、数字编造。
+    EvalCase(
+        id="doc_q2_review_brief",
+        question="请根据知识库中的材料，写一份面向管理层的 Q2 复盘简报。",
+        expect_any=[
+            # 素材里的核心事实（不引用素材写不出来）
+            ["96", "达成率"],
+            ["华东"],
+        ],
+        expect_docs=["q2-2026-review"],
+        require_knowledge=True,
+        expect_roles=["retriever", "writer", "reviewer"],
+        note="文档场景：链路应为 检索→写作→审校，文档内容须来自复盘纪要",
+    ),
+    EvalCase(
+        id="doc_return_policy_notice",
+        question=(
+            "请根据知识库中的材料，写一份面向客服团队的通知，"
+            "说明线上渠道退货政策在 2026 年 8 月起的调整要点，"
+            "以及客服接待用户时需要注意什么。"
+        ),
+        expect_any=[
+            ["免运费", "运费"],
+            ["质检", "全量", "审核"],
+        ],
+        expect_docs=["return-policy"],
+        require_knowledge=True,
+        expect_roles=["writer", "reviewer"],
+        note="文档场景第二例：体裁不同（通知、面向客服），同样是素材驱动写作",
+    ),
+    # ---------------------- 长期记忆用例（跨会话回归） ----------------------
+    EvalCase(
+        id="memory_recall_previous_conclusion",
+        question="上次分析华东区 9 月销售额下滑，当时的结论是什么？请回顾一下。",
+        expect_any=[["20.8", "20.9", "下滑", "下降"]],
+        # 结构性证据：记忆必须**真的被检索到**（清空记忆库该断言立即失败，
+        # 与 RAG 用例的牙齿同一套方法——只查答案文本区分不出「真查了记忆」
+        # 与「重新跑了一遍 SQL 恰好得到相同数字」）。
+        expect_memories=["华东"],
+        requires_case="core_decline_cause",
+        expect_roles=["analyst", "reviewer"],
+        note="跨会话用例：依赖 core_decline_cause 先沉淀记忆（runner 自动补齐前置用例）",
     ),
 ]
 

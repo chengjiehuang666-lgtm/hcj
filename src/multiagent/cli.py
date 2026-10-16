@@ -74,7 +74,9 @@ def _print_outcome(outcome) -> int:
 
     print("\n【黑板条目】")
     for key, entry in outcome.blackboard.items():
-        print(f"  · {key} v{entry.get('version')} by {entry.get('written_by')} "
+        by = entry.get("written_by") or {}
+        who = f"{by.get('agent_role')}@{by.get('agent_version')}({by.get('node_id')})"
+        print(f"  · {key} v{entry.get('version')} [{entry.get('status')}] by {who} "
               f"(sources={len(entry.get('sources', []))})")
 
     return 0

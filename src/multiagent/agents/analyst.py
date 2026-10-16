@@ -67,7 +67,11 @@ _CONCLUDE_SYSTEM = """你是资深数据分析师，负责基于**给定查询�
 6. 下方可能给出「业务背景资料」。它**只能用于解释原因**（例如说明某段时间退货率
    上升是口径调整而非质量恶化），**严禁把其中的数字当作查询结果引用**——
    那是编造数据。引用背景资料时请注明出处文档标题。
-7. 输出单个 JSON 对象，不要 markdown 围栏：
+7. 下方可能给出「历史结论」（以往任务的沉淀）。它**只能用于承接与回顾**
+   （例如问题本身就是问上次的结论），**不得当作本次分析的数据证据**——
+   本次结论里的数字仍必须来自本次查询结果；若只引用历史结论，必须在文中注明
+   它是历史结论而非本次查询所得。
+8. 输出单个 JSON 对象，不要 markdown 围栏：
    {"summary": "...", "key_findings": ["...", "..."], "insufficient_data": false, "confidence": 0.8}"""
 
 
@@ -91,6 +95,17 @@ def _knowledge_text(knowledge: list[dict], *, limit: int = 4, per_chunk: int = 4
     for item in knowledge[:limit]:
         content = str(item.get("content", "")).replace("\n", " ")[:per_chunk]
         lines.append(f"《{item.get('title', '?')}》片段{item.get('chunk_index', 0)}：{content}")
+    return "\n".join(lines)
+
+
+def _memory_text(memories: list[dict], *, limit: int = 3, per_item: int = 500) -> str:
+    """把检索到的历史结论压成提示词片段（无命中时返回空串，不占提示词）。"""
+    if not memories:
+        return ""
+    lines = []
+    for item in memories[:limit]:
+        content = str(item.get("content", "")).replace("\n", " ")[:per_item]
+        lines.append(f"- （来源：{item.get('source_ref', '?')}）{content}")
     return "\n".join(lines)
 
 
@@ -139,7 +154,13 @@ class AnalystAgent(BaseAgent):
         rows_text: str,
         row_count: int,
         knowledge_text: str,
+        memories_text: str = "",
     ) -> _Conclusion:
+        memory_section = (
+            f"\n\n历史结论（以往任务沉淀，**仅供承接与回顾**）：\n{memories_text}"
+            if memories_text
+            else ""
+        )
         return await self.call_json(
             ctx,
             system=_CONCLUDE_SYSTEM,
@@ -149,6 +170,7 @@ class AnalystAgent(BaseAgent):
                 f"查询结果（共 {row_count} 行）：\n{rows_text}\n\n"
                 f"业务背景资料（仅可用于解释原因，其中的数字不得当作查询结果）：\n"
                 f"{knowledge_text}"
+                f"{memory_section}"
             ),
             model_cls=_Conclusion,
             usage=usage,
@@ -164,6 +186,7 @@ class AnalystAgent(BaseAgent):
         data_ranges = inv.input.get("data_ranges", "")
         definitions = inv.input.get("metric_definitions", {})
         knowledge = inv.input.get("knowledge", []) or []
+        memories = inv.input.get("memories", []) or []
         now = inv.input.get("now", "")
         acceptance: list[str] = inv.input.get("acceptance", []) or []
 
@@ -174,6 +197,7 @@ class AnalystAgent(BaseAgent):
         ) or "（无口径数据）"
         acceptance_text = "\n".join(f"- {a}" for a in acceptance)
         knowledge_text = _knowledge_text(knowledge)
+        memories_text = _memory_text(memories)
 
         base_user = (
             f"当前时间：{now}\n\n"
@@ -220,6 +244,7 @@ class AnalystAgent(BaseAgent):
                     rows_text=result.as_prompt_text(),
                     row_count=result.row_count,
                     knowledge_text=knowledge_text,
+                    memories_text=memories_text,
                 )
                 if best is None or not conclusion.insufficient_data:
                     best = (plan, result, conclusion)

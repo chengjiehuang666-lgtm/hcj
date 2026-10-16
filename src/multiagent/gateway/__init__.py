@@ -29,6 +29,8 @@ from .router import (
     ROUTE_ANALYST_SQL,
     ROUTE_DEFAULT,
     ROUTE_PLANNER,
+    ROUTE_REVIEWER,
+    ROUTE_WRITER,
     TIER_FAST,
     TIER_REASONING,
     ModelRouter,
@@ -50,6 +52,8 @@ __all__ = [
     "ROUTE_PLANNER",
     "ROUTE_ANALYST_SQL",
     "ROUTE_ANALYST_CONCLUDE",
+    "ROUTE_REVIEWER",
+    "ROUTE_WRITER",
     "ROUTE_DEFAULT",
     "KNOWN_ROUTES",
     # 数据结构与异常
