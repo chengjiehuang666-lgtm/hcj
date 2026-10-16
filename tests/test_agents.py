@@ -323,17 +323,29 @@ def test_absorb_does_not_leak_previous_state() -> None:
 # ------------------------------------------------- Retriever（需要数据库则跳过）
 
 
+def _skip_if_db_unreachable() -> None:
+    """只在**连接层**不可达时跳过。
+
+    旧写法把「任何 failed 结果」一律 skip 成「数据库不可达」——代码缺陷导致的
+    真实回归（如 SQL 写错表名）会被静默跳过、套件仍然全绿（W6 独立复核确认）。
+    正确做法是先探连接：库通了，后续断言就必须真刀真枪地过。
+    """
+    import psycopg
+
+    try:
+        with psycopg.connect(settings.postgres_ro_dsn, connect_timeout=5):
+            pass
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"数据库不可达: {exc}")
+
+
 def test_retriever_returns_metric_definitions_from_db() -> None:
     import asyncio
 
+    _skip_if_db_unreachable()
     gateway = FakeGateway()  # 本节点不应调用模型
-    try:
-        result = asyncio.run(RetrieverAgent().invoke(_invocation(), _ctx(gateway)))
-    except Exception as exc:
-        pytest.skip(f"数据库不可达: {exc}")
-    if result.status is ResultStatus.failed:
-        pytest.skip(f"数据库不可达: {result.error.message}")
-    assert result.status is ResultStatus.ok
+    result = asyncio.run(RetrieverAgent().invoke(_invocation(), _ctx(gateway)))
+    assert result.status is ResultStatus.ok, result.error
     defs = result.outputs["metric_definitions"]
     assert "revenue" in defs and "refund_rate" in defs
     assert gateway.calls == 0, "口径是结构化数据，直查即可，不该额外调用模型"
@@ -377,12 +389,9 @@ def test_analyst_uses_distinct_routes_for_sql_and_conclusion() -> None:
     inv = _node_invocation("analyst_1", "analyst")
     import asyncio
 
-    try:
-        result = asyncio.run(AnalystAgent().invoke(inv, _ctx(gateway)))
-    except Exception as exc:
-        pytest.skip(f"数据库不可达: {exc}")
-    if result.status is ResultStatus.failed:
-        pytest.skip(f"数据库不可达: {result.error.message}")
+    _skip_if_db_unreachable()
+    result = asyncio.run(AnalystAgent().invoke(inv, _ctx(gateway)))
+    assert result.status is ResultStatus.ok, result.error
     assert gateway.routes_seen == ["analyst_sql", "analyst_conclude"], gateway.routes_seen
 
 
@@ -402,11 +411,11 @@ def test_retriever_metrics_mode_skips_knowledge() -> None:
     """mode=metrics 只走 SQL，不碰知识库——这是两路并行不重叠的前提。"""
     import asyncio
 
+    _skip_if_db_unreachable()
     gateway = FakeGateway()
     inv = _retriever_invocation("retriever_1", mode="metrics")
     result = asyncio.run(RetrieverAgent().invoke(inv, _ctx(gateway)))
-    if result.status is ResultStatus.failed:
-        pytest.skip(f"数据库不可达: {result.error.message}")
+    assert result.status is ResultStatus.ok, result.error
 
     assert "metric_definitions" in result.outputs
     assert "schema" in result.outputs and "data_ranges" in result.outputs
@@ -432,10 +441,10 @@ def test_retriever_all_mode_is_default_and_does_both() -> None:
     import asyncio
 
     gateway = FakeGateway()
+    _skip_if_db_unreachable()
     inv = _retriever_invocation("retriever_1")  # 不传 mode
     result = asyncio.run(RetrieverAgent().invoke(inv, _ctx(gateway)))
-    if result.status is ResultStatus.failed:
-        pytest.skip(f"数据库不可达: {result.error.message}")
+    assert result.status is ResultStatus.ok, result.error
 
     assert "metric_definitions" in result.outputs
     assert "knowledge" in result.outputs
@@ -524,10 +533,10 @@ def test_retriever_metrics_mode_always_has_sources(monkeypatch) -> None:
     """指标口径为空时同样要留下来源记录（走 SQL，天然有 sql 来源）。"""
     import asyncio
 
+    _skip_if_db_unreachable()
     inv = _retriever_invocation("retriever_1", mode="metrics")
     result = asyncio.run(RetrieverAgent().invoke(inv, _ctx(FakeGateway())))
-    if result.status is ResultStatus.failed:
-        pytest.skip(f"数据库不可达: {result.error.message}")
+    assert result.status is ResultStatus.ok, result.error
     assert result.sources
 
 
@@ -635,3 +644,138 @@ def test_planner_requires_available_roles() -> None:
 
 
 # ------------------------------------------------------------------------- 运行器
+
+
+# ---------------------------------------- Planner 门禁（W6 复核后的代码侧加固）
+
+
+def test_planner_rejects_invalid_retriever_mode() -> None:
+    """非法 mode 必须在**规划期**拦下——执行期失败会白烧规划与全部前序 token。"""
+    import asyncio
+
+    gateway = FakeGateway(_plan_with_retrievers("policy", "knowledge"))
+    result = asyncio.run(PlannerAgent().invoke(_invocation(), _ctx(gateway)))
+    assert result.status is ResultStatus.failed
+    assert result.error.code == "UNSUPPORTED_PLAN"
+    assert "取值非法" in result.error.message
+
+
+def test_planner_rejects_single_invalid_mode_too() -> None:
+    """单 retriever 的 mode 取值同样要校验（旧门禁在少于两个检索时整段跳过）。"""
+    import asyncio
+
+    gateway = FakeGateway(
+        _plan(
+            [
+                _node_payload("retriever_1", "retriever", [], mode="policy"),
+                _node_payload("analyst_1", "analyst", ["retriever_1"]),
+            ]
+        )
+    )
+    result = asyncio.run(PlannerAgent().invoke(_invocation(), _ctx(gateway)))
+    assert result.status is ResultStatus.failed
+    assert "取值非法" in result.error.message
+
+
+def _reviewer_plan(deps: list[str]) -> str:
+    return _plan(
+        [
+            _node_payload("retriever_1", "retriever", [], mode="metrics"),
+            _node_payload("analyst_1", "analyst", ["retriever_1"]),
+            _node_payload("reviewer_1", "reviewer", deps),
+        ]
+    )
+
+
+def test_planner_rejects_reviewer_with_missing_dependencies() -> None:
+    """「reviewer 依赖其余全部节点」必须有**代码门禁**，不能只靠提示词。
+
+    独立复核发现：漏依赖的规划会被照单接受，而状态流转与记忆沉淀门槛都只看
+    verdict、不看核验范围——未被核对的结论可以以「已过评审」身份沉淀入库。
+    """
+    import asyncio
+
+    gateway = FakeGateway(_reviewer_plan(["analyst_1"]))  # 漏了 retriever_1
+    inv = _invocation(available_roles=["retriever", "analyst", "reviewer"])
+    result = asyncio.run(PlannerAgent().invoke(inv, _ctx(gateway)))
+    assert result.status is ResultStatus.failed
+    assert result.error.code == "UNSUPPORTED_PLAN"
+    assert "depends_on 缺少" in result.error.message
+
+
+def test_planner_accepts_reviewer_covering_all_upstream() -> None:
+    import asyncio
+
+    gateway = FakeGateway(_reviewer_plan(["retriever_1", "analyst_1"]))
+    inv = _invocation(available_roles=["retriever", "analyst", "reviewer"])
+    result = asyncio.run(PlannerAgent().invoke(inv, _ctx(gateway)))
+    assert result.status is ResultStatus.ok, result.error
+
+
+def test_planner_rejects_multiple_reviewers() -> None:
+    """多 reviewer 会在同一 superstep 并发更新同一批条目（乐观锁冲突消解属 W7），
+    当前设计是单一汇点评审——在执行前拦掉，而不是让状态流转静默丢一方。"""
+    import asyncio
+
+    gateway = FakeGateway(
+        _plan(
+            [
+                _node_payload("retriever_1", "retriever", [], mode="metrics"),
+                _node_payload("analyst_1", "analyst", ["retriever_1"]),
+                _node_payload("reviewer_1", "reviewer", ["retriever_1", "analyst_1"]),
+                _node_payload("reviewer_2", "reviewer", ["analyst_1"]),
+            ]
+        )
+    )
+    inv = _invocation(available_roles=["retriever", "analyst", "reviewer"])
+    result = asyncio.run(PlannerAgent().invoke(inv, _ctx(gateway)))
+    assert result.status is ResultStatus.failed
+    assert "多个 reviewer" in result.error.message
+
+
+# ------------------------------------------------ 预算派生（只能收紧）
+
+
+def test_invocation_budget_derives_from_task_budget() -> None:
+    """AgentInvocation.budget 派生自任务预算且**只能收紧**（冻结契约语义）。
+
+    独立复核发现：旧实现直接取 Settings 默认值，提交方在 TaskEvent.budget 里
+    收紧的额度被忽略（甚至比提交方要求的更宽）。
+    """
+    import asyncio  # noqa: F401
+    from datetime import datetime, timedelta, timezone
+
+    from multiagent.contracts import Budget
+    from multiagent.graph.pipeline import AnalysisPipeline
+
+    pipeline = AnalysisPipeline(settings)
+
+    tight = Budget(
+        max_tokens=1000,
+        deadline=datetime.now(timezone.utc) + timedelta(minutes=3),
+    )
+    inv = pipeline._make_invocation(
+        "retriever_1", "retriever", {}, task_id="t-1", budget=tight
+    )
+    assert inv.budget.max_tokens == 1000, "提交方收紧的额度必须生效"
+    assert inv.budget.timeout_seconds <= 180, "deadline 必须参与派生"
+
+    # 宽松的预算不得把调用额度放宽到超过本地默认
+    loose = Budget(
+        max_tokens=10_000_000,
+        deadline=datetime.now(timezone.utc) + timedelta(hours=5),
+    )
+    inv2 = pipeline._make_invocation(
+        "retriever_1", "retriever", {}, task_id="t-1", budget=loose
+    )
+    assert inv2.budget.max_tokens == settings.default_max_tokens
+
+    # 图内节点走序列化 dict 形态（state 必须可 JSON 序列化）
+    inv3 = pipeline._make_invocation(
+        "retriever_1",
+        "retriever",
+        {},
+        task_id="t-1",
+        budget={"max_tokens": 500, "deadline": "2026-01-01T00:00:00+08:00"},
+    )
+    assert inv3.budget.max_tokens == 500

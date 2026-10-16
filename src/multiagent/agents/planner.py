@@ -161,6 +161,16 @@ class PlannerAgent(BaseAgent):
                 duration_ms=int((time.perf_counter() - started) * 1000),
             )
 
+        if reason := self._validate_reviewer_scope(dag):
+            return self.failed(
+                inv,
+                code="UNSUPPORTED_PLAN",
+                message=reason,
+                retryable=True,
+                usage=usage,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+
         return self.ok(
             inv,
             outputs={
@@ -200,15 +210,30 @@ class PlannerAgent(BaseAgent):
 
     @staticmethod
     def _validate_retriever_modes(dag: SubtaskDAG) -> str | None:
-        """多个 retriever 必须用 mode 分工，否则会重复做同一件事。
+        """retriever 的 mode 必须**取值合法**，多个之间必须分工不重复。
 
-        两个都缺 mode 时它们都会执行「全量检索」，白白重复一遍且并行毫无收益——
-        这是典型的规划缺陷，应当在门禁处拦掉而不是放任浪费。
+        取值校验对准一个真实缺陷（独立复核实跑确认）：非法 mode（如 "policy"）此前
+        能通过规划门禁，到执行期才让整个任务以 retriever 的 BAD_INPUT（不可重试）
+        失败——规划与全部前序 token 都白烧，违背本文件名下的「早报错比晚失败好」。
         """
+        from .retriever import VALID_MODES
+
         retrievers = [n for n in dag.nodes if n.agent_role is AgentRole.retriever]
+        if not retrievers:
+            return None
+        modes = [str((n.inputs or {}).get("mode") or "").lower() for n in retrievers]
+        invalid = [
+            f"{n.node_id}(mode={m or '空'})"
+            for n, m in zip(retrievers, modes)
+            if m and m not in VALID_MODES
+        ]
+        if invalid:
+            return (
+                f"retriever 的 inputs.mode 取值非法: {invalid}；"
+                f"合法取值为 {sorted(VALID_MODES)}。"
+            )
         if len(retrievers) < 2:
             return None
-        modes = [str((n.inputs or {}).get("mode") or "") for n in retrievers]
         missing = [n.node_id for n, mode in zip(retrievers, modes) if not mode]
         if missing:
             return (
@@ -218,4 +243,38 @@ class PlannerAgent(BaseAgent):
         duplicated = {m for m in modes if modes.count(m) > 1}
         if duplicated:
             return f"retriever 节点的 inputs.mode 重复: {sorted(duplicated)}；每个模式只应出现一次。"
+        return None
+
+    @staticmethod
+    def _validate_reviewer_scope(dag: SubtaskDAG) -> str | None:
+        """reviewer 的核验范围必须有**代码门禁**，不能只靠提示词。
+
+        独立复核发现：`reviewer 依赖除自己外全部节点` 此前只是提示词约束；漏依赖
+        的规划会被照单接受，而条目状态流转与长期记忆沉淀门槛都只看 verdict、
+        不看核验范围——未被核对的结论能以「已过评审」身份沉淀入库。
+
+        门禁两条：
+        1. **至多一个 reviewer**：多个 reviewer 会各自以乐观锁更新同一批上游条目，
+            在同一个 superstep 内并发写同一键，reducer 的「后写覆盖」会静默丢掉
+            一方的状态流转（引擎级缺口，属 W7 的冲突消解范围）。当前设计里
+            reviewer 是唯一汇点，多 reviewer 的分支形态留待 W7 再开。
+        2. reviewer 的 depends_on 必须**覆盖全部非 reviewer 节点**，否则拒绝规划。
+        """
+        reviewers = [n for n in dag.nodes if n.agent_role is AgentRole.reviewer]
+        if not reviewers:
+            return None
+        if len(reviewers) > 1:
+            ids = sorted(n.node_id for n in reviewers)
+            return (
+                f"规划包含多个 reviewer 节点 {ids}；当前只支持单一汇点评审"
+                "（多 reviewer 会并发更新同一批条目，冲突消解属 W7）。"
+            )
+        reviewer = reviewers[0]
+        covered = {n.node_id for n in dag.nodes if n.agent_role is not AgentRole.reviewer}
+        missing = sorted(covered - set(reviewer.depends_on))
+        if missing:
+            return (
+                f"reviewer 节点 {reviewer.node_id} 的 depends_on 缺少 {missing}；"
+                "评审必须依赖图中其余全部节点，否则未被核对的结论会被标为已审。"
+            )
         return None

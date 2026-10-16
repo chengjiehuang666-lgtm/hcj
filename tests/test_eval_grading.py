@@ -26,6 +26,7 @@ class FakeOutcome:
         insufficient: bool = False,
         row_count: int | None = 3,
         knowledge: list[dict] | None = None,
+        memories: list[dict] | None = None,
     ) -> None:
         self.status = status
         self.summary = summary
@@ -34,7 +35,7 @@ class FakeOutcome:
             {
                 "node_id": "retriever_1",
                 "agent_role": "retriever",
-                "outputs": {"knowledge": knowledge or []},
+                "outputs": {"knowledge": knowledge or [], "memories": memories or []},
             },
             {
                 "node_id": "analyst_1",
@@ -198,3 +199,41 @@ def test_multiple_expected_docs_accept_any_match() -> None:
     outcome = FakeOutcome(knowledge=[{"doc_id": "region-definition"}])
     passed, failed, _, _ = grade(case, outcome)
     assert passed, failed
+
+
+# --------------------------------------------------------- 记忆的来源绑定（A）
+
+
+def test_memory_binding_requires_source_from_this_run() -> None:
+    """记忆断言必须绑定**本次运行**：历史沉淀满足子串也不能算通过。
+
+    独立复核发现：只断言「命中含华东」时，开发库里积累的历史记忆会让用例假绿——
+    沉淀链路坏掉也照样通过。绑定到前置用例本次运行的 task_id 才有牙齿。
+    """
+    case = EvalCase(
+        id="mem",
+        question="q",
+        expect_memories=["华东"],
+        memory_source_case="producer",
+    )
+    fresh = FakeOutcome(
+        memories=[{"content": "华东区下滑", "source_ref": "任务 run-1，SQL sha256:x"}]
+    )
+    assert grade(case, fresh, memory_source_task_id="run-1")[0] is True
+
+    # 内容含「华东」但来自历史任务（非本次运行）→ 必须失败
+    stale = FakeOutcome(
+        memories=[{"content": "华东区下滑", "source_ref": "任务 old-run，SQL sha256:y"}]
+    )
+    passed, failed, _, _ = grade(case, stale, memory_source_task_id="run-1")
+    assert passed is False
+    assert any("未绑定本次运行" in f for f in failed), failed
+
+    # 前置用例根本没跑 → 明确报「前置用例未运行」而不是静默通过
+    passed2, failed2, _, _ = grade(case, stale, memory_source_task_id=None)
+    assert passed2 is False
+    assert any("前置用例未运行" in f for f in failed2), failed2
+
+    # 未声明来源绑定的用例不受影响（向后兼容）
+    plain = EvalCase(id="mem2", question="q", expect_memories=["华东"])
+    assert grade(plain, stale, memory_source_task_id="run-1")[0] is True

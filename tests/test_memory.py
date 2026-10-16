@@ -202,8 +202,8 @@ def test_sink_dedup_and_retrieval() -> None:
         memory_id = store.sink(entry)
         assert memory_id is not None
 
-        # 重复沉淀（同 task_id）按已有条目处理，不产生第二条
-        assert store.sink(entry) is None
+        # 重复沉淀（同内容）刷新既有条目、返回同一个 id，不产生第二条
+        assert store.sink(entry) == memory_id
 
         # 检索命中：用探针标记查询、按 memory_id 断言——开发库可能还有真实记忆，
         # 绝对计数断言会误伤
@@ -360,3 +360,37 @@ def test_pipeline_sink_hook_records_success(monkeypatch) -> None:
 
     assert outcome.memory_sunk == 42
     assert any(name == "memory_sunk" for name, _ in events)
+
+
+def test_sink_dedupes_identical_content_across_runs() -> None:
+    """跨运行判重必须按**内容**。
+
+    独立复核发现：每次运行都是新 task_id（UUID），`UNIQUE (task_id)` 对
+    「同题重跑/多轮评测」永不生效——实测一轮 27 条评测给库里堆了 19 条近重复结论。
+    """
+    _db_ready()
+    store = _store()
+    _purge_own()
+    try:
+        entry_a = _test_entry(f"{_TEST_PREFIX}dup-a")
+        entry_b = _test_entry(f"{_TEST_PREFIX}dup-b")
+        assert entry_a["content"] != entry_b["content"]  # 探针标记不同
+        entry_b["content"] = entry_a["content"]  # 模拟同题两轮的近重复结论
+
+        first_id = store.sink(entry_a)
+        assert first_id is not None
+        # 同内容 → 刷新既有条目的来源（供「记忆来自本次运行」的绑定断言），不新增行
+        assert store.sink(entry_b) == first_id
+        import psycopg
+
+        with psycopg.connect(settings.postgres_dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT count(*) FROM memory_entries WHERE content = %s",
+                    (entry_a["content"],),
+                )
+                assert cur.fetchone()[0] == 1, "同内容只应有一行"
+                cur.execute("SELECT source_ref FROM memory_entries WHERE id = %s", (first_id,))
+                assert f"{_TEST_PREFIX}dup-b" in cur.fetchone()[0], "来源应刷新为最近一次运行"
+    finally:
+        _purge_own()

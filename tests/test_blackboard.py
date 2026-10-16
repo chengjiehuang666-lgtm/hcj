@@ -255,3 +255,27 @@ def test_node_input_delivers_upstream_blackboard_and_sources() -> None:
     assert inputs["question"] == "分析下滑原因"
     assert inputs["acceptance"] == ["给出至少一个渠道的下滑幅度"]
     assert inputs["node_id"] == "analyst_1"
+
+
+def test_entry_omits_none_confidence_for_schema_conformance() -> None:
+    """confidence=None 时条目**不得**输出 `"confidence": null`。
+
+    独立复核发现：AgentResult.confidence 是可选的合法形态，而裸 model_dump 会把
+    None 序列化成 null——冻结 schema 的 confidence 只允许 number（无 null 分支），
+    条目会被冻结契约拒绝（BaseAgent.ok 的默认 confidence 就是 None，属潜伏触发面）。
+    """
+    inv = _inv("analyst_1", "analyst")
+    res = _result(
+        "analyst_1",
+        outputs={"summary": "x"},
+        writes=["analyst_1.report"],
+    )
+    assert res.confidence is None  # 本用例的前提：置信度确实缺省
+
+    delta = AnalysisPipeline._absorb(inv, res, AnalystAgent(), written_at=FIXED_AT)
+    entry = delta["blackboard"]["analyst_1.report"]
+
+    assert "confidence" not in entry, "None 必须被省略而不是序列化成 null"
+    # 省略后仍能被契约解析（confidence 在契约里可选）
+    parsed = BlackboardEntry.model_validate(entry)
+    assert parsed.confidence is None

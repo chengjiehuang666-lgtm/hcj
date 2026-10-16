@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     superseded_by bigint REFERENCES memory_entries(id),
     ttl_seconds   integer,
     created_at    timestamptz NOT NULL DEFAULT now(),
-    -- 一个任务沉淀一条：重跑（如评测重跑）不会堆出重复结论
+    -- 同一任务不重复写入（task_id 每次运行都是新 UUID，仅此约束**防不了**
+    -- 同题重跑堆重复结论——跨运行去重在应用层按 content 判重，见 memory/store.py）
     CONSTRAINT memory_entries_task_unique UNIQUE (task_id)
 );
 

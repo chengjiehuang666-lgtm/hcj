@@ -137,8 +137,8 @@ class Settings(BaseSettings):
     default_max_steps: int = 30
     # 任务级 Token 熔断阈值，即《实施路线图》待定项 D2。
     # 定值规则：评测实测最大 × 1.5 安全系数、向上取整到万。
-    #   W4（无 reviewer）：最大 20,550 → 40,000
-    #   W6（含 reviewer）：最大 33,842 → 60,000（实测见路线图 §3.11）
+    #   W4（无 reviewer，20 条）：最大 20,550 → 40,000
+    #   W6（含 reviewer，27 条）：最大 37,842 → 60,000（实测见路线图 §3.11）
     default_max_tokens: int = 60_000
     default_max_retries: int = 2
     default_task_timeout_seconds: int = 300

@@ -83,6 +83,9 @@ class CaseResult:
     review_issues: int | None = None
     #: 检索阶段实际取到的长期记忆条数——记忆回归的结构性证据
     memory_count: int = 0
+    #: 本次任务是否真的沉淀进长期记忆（None=未沉淀/不适用）；失败原因
+    memory_sunk: int | None = None
+    memory_error: str | None = None
 
 
 def _nodes_by_role(outcome, role: str) -> list[dict]:
@@ -126,6 +129,15 @@ def _retrieved_memories(outcome) -> list[str]:
     return texts
 
 
+def _retrieved_memory_refs(outcome) -> list[str]:
+    """汇总所有 retriever 节点取到的长期记忆**来源出处**（用于绑定本次运行）。"""
+    refs: list[str] = []
+    for res in _nodes_by_role(outcome, "retriever"):
+        for item in (res.get("outputs") or {}).get("memories", []) or []:
+            refs.append(str(item.get("source_ref", "")))
+    return refs
+
+
 def _writer_outputs(outcome) -> dict:
     """写作节点的产物（多节点时按顺序合并）。"""
     merged: dict = {}
@@ -145,8 +157,18 @@ def _review_summary(outcome) -> tuple[str | None, int | None]:
     return outputs.get("verdict"), outputs.get("issue_count")
 
 
-def grade(case: EvalCase, outcome) -> tuple[bool, list[str], list[str], bool]:
-    """返回 (是否通过, 未命中的检查项, 命中的禁用词, 是否判定数据不足)。"""
+def grade(
+    case: EvalCase,
+    outcome,
+    *,
+    memory_source_task_id: str | None = None,
+) -> tuple[bool, list[str], list[str], bool]:
+    """返回 (是否通过, 未命中的检查项, 命中的禁用词, 是否判定数据不足)。
+
+    `memory_source_task_id`：`memory_source_case` 所指前置用例**本次运行**的
+    task_id。记忆用例要求召回来自它——开发库里积累的历史沉淀随时可满足子串断言，
+    只有绑定到本次运行，沉淀链路坏掉时用例才会真失败（独立复核确认的缺口）。
+    """
     outputs = _analyst_outputs(outcome)
     insufficient = bool(outputs.get("insufficient_data"))
 
@@ -196,6 +218,18 @@ def grade(case: EvalCase, outcome) -> tuple[bool, list[str], list[str], bool]:
         exp in t for exp in case.expect_memories for t in memories
     ):
         failed.append("记忆:" + "|".join(case.expect_memories))
+    # 来源绑定：召回必须来自**本次运行**的前置用例（source_ref 含其 task_id）
+    if case.memory_source_case:
+        if not memory_source_task_id:
+            failed.append(f"前置用例未运行:{case.memory_source_case}")
+        else:
+            bound = [
+                m
+                for m in _retrieved_memory_refs(outcome)
+                if memory_source_task_id in m
+            ]
+            if not bound:
+                failed.append(f"记忆未绑定本次运行:{case.memory_source_case}")
 
     hit_forbidden = [w for w in case.forbid if _matches(text, w)]
     return (not failed and not hit_forbidden), failed, hit_forbidden, insufficient
@@ -291,9 +325,13 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
     )
 
     started = time.perf_counter()
+    #: case_id -> 本次运行的 task_id。记忆来源绑定需要它：
+    #: 「召回来自本次运行的前置用例」只能靠 task_id 比对（见 grade 的文档串）。
+    case_task_ids: dict[str, str] = {}
     for index, case in enumerate(cases, start=1):
         print(f"[{index}/{len(cases)}] {case.id} … ", end="", flush=True)
         event = new_task_event(case.question)
+        case_task_ids[case.id] = str(event.task_id)
         try:
             outcome = await pipeline.run(event)
         except Exception as exc:  # 单条用例失败不应中断整轮评测
@@ -317,7 +355,15 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
             print("崩溃")
             continue
 
-        passed, failed, forbidden, insufficient = grade(case, outcome)
+        passed, failed, forbidden, insufficient = grade(
+            case,
+            outcome,
+            memory_source_task_id=(
+                case_task_ids.get(case.memory_source_case)
+                if case.memory_source_case
+                else None
+            ),
+        )
         outputs = _analyst_outputs(outcome)
         docs = _retrieved_docs(outcome)
         verdict, issue_count = _review_summary(outcome)
@@ -345,6 +391,8 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
                 review_verdict=verdict,
                 review_issues=issue_count,
                 memory_count=len(memories),
+                memory_sunk=outcome.memory_sunk,
+                memory_error=outcome.memory_error,
             )
         )
         if passed:

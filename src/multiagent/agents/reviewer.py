@@ -87,6 +87,26 @@ class _Verdict(BaseModel):
     confidence: float = Field(default=0.5, ge=0, le=1)
 
 
+def effective_verdict(review: _Verdict) -> str:
+    """按**代码**落实 verdict 判定规则，而不是只写在提示词里。
+
+    独立复核发现：模型可能输出自相矛盾的评审（verdict=pass 却带着 unmet 或
+    blocker），旧的实现照单全收并据此把条目标为 validated——而 verdict 又决定
+    长期记忆的沉淀门槛，错版会一路传下去。规则以代码为准：
+
+    - 任一 unmet 或任一 blocker → fail
+    - 否则有 major/minor 问题、或存在 unverifiable → pass_with_issues
+    - 否则 pass
+    """
+    if any(c.result == "unmet" for c in review.checks) or any(
+        i.severity == "blocker" for i in review.issues
+    ):
+        return "fail"
+    if review.issues or any(c.result == "unverifiable" for c in review.checks):
+        return "pass_with_issues"
+    return "pass"
+
+
 def _field_view(key: str, value: Any) -> Any:
     """按字段裁剪大对象：行预览只留前 20 行，知识片段保留出处、正文截断。"""
     if key == "rows_preview" and isinstance(value, list):
@@ -192,8 +212,10 @@ class ReviewerAgent(BaseAgent):
             )
 
         # 审查结论经乐观锁流转上游条目状态：fail → rejected，否则 validated。
-        # expected_version 取本轮实际读到的版本；版本不符会被 pipeline 拒绝写入。
-        target_status = "rejected" if review.verdict == "fail" else "validated"
+        # verdict 以**代码规则**为准（effective_verdict），模型的自报值单独留档：
+        # 两者不一致说明模型输出了自相矛盾的评审，值得被发现。
+        verdict = effective_verdict(review)
+        target_status = "rejected" if verdict == "fail" else "validated"
         updates = [
             {
                 "key": key,
@@ -217,7 +239,9 @@ class ReviewerAgent(BaseAgent):
         return self.ok(
             inv,
             outputs={
-                "verdict": review.verdict,
+                "verdict": verdict,
+                # 模型自报的 verdict 单独留档：与规则不一致时便于发现模型输出问题
+                "model_verdict": review.verdict,
                 "checks": [c.model_dump() for c in review.checks],
                 "issues": [i.model_dump() for i in review.issues],
                 "issue_count": len(review.issues),

@@ -40,6 +40,9 @@ class EvalCase:
     #: 前置用例：本用例依赖它先执行（如记忆用例依赖产生记忆的分析用例）。
     #: runner 会自动补齐并把前置用例排到前面；`--no-prereq` 可关闭（用于牙齿演示）。
     requires_case: str | None = None
+    #: 记忆来源绑定：要求召回的记忆**来自该用例这一次运行**（source_ref 含其 task_id）。
+    #: 只查「命中含华东」不够——开发库里的历史沉淀会让断言假通过（独立复核确认）。
+    memory_source_case: str | None = None
     note: str = ""
 
 
@@ -264,6 +267,9 @@ CASES: list[EvalCase] = [
         # 与「重新跑了一遍 SQL 恰好得到相同数字」）。
         expect_memories=["华东"],
         requires_case="core_decline_cause",
+        # 记忆必须来自**本次运行**的前置用例（source_ref 含其 task_id）：
+        # 开发库里积累的历史沉淀随时含「华东」，仅靠子串断言会在沉淀链路坏掉时假绿
+        memory_source_case="core_decline_cause",
         # 只要求评审在场；不要求 analyst——口径/回顾类问题有时会被 Planner 规划到
         # 写作路径（writer→reviewer），那同样是合法链路，断言不应因此假失败
         expect_roles=["reviewer"],

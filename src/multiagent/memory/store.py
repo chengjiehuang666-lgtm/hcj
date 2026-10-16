@@ -117,14 +117,23 @@ class MemoryStore:
     # ------------------------------------------------------------------ 写入
 
     def sink(self, entry: dict[str, Any]) -> int | None:
-        """写入一条记忆；同一 task_id 重复沉淀按既有条目处理（返回 None）。
+        """写入一条记忆；内容已存在时**刷新其来源**。
 
-        沉淀即意味着已过评审门槛，因此直接写 `status='validated'`。
+        **判重必须按内容**：每次任务运行都是新 task_id（UUID），仅靠
+        `UNIQUE (task_id)` 的去重对「同题重跑 / 多轮评测」永不生效——独立复核实测
+        一轮 27 条评测就给库里堆了 19 条近重复结论。
+
+        命中同内容时不新增行，而是把 source_ref 刷新为本次运行——「记忆来自本次
+        运行」的绑定断言（eval 的记忆用例）依赖它：刷新后回归里的 source_ref
+        携带本次前置用例的 task_id，既去了重又保住了牙齿。返回条目 id
+        （新增或命中都返回；仅同任务重复写入时为 None）。
         """
         import psycopg
 
         vector = to_pgvector_literal(self._embedder.embed_one(entry["content"]))
-        sql = """
+        find_sql = "SELECT id FROM memory_entries WHERE content = %s LIMIT 1"
+        refresh_sql = "UPDATE memory_entries SET source_ref = %s WHERE id = %s"
+        insert_sql = """
             INSERT INTO memory_entries
                    (task_id, node_id, kind, content, embedding,
                     source_type, source_ref, confidence, status)
@@ -137,7 +146,12 @@ class MemoryStore:
         try:
             with psycopg.connect(self._settings.postgres_dsn) as conn:
                 with conn.cursor() as cur:
-                    cur.execute(sql, params)
+                    cur.execute(find_sql, (entry["content"],))
+                    existing = cur.fetchone()
+                    if existing is not None:
+                        cur.execute(refresh_sql, (entry["source_ref"], existing[0]))
+                        return int(existing[0])
+                    cur.execute(insert_sql, params)
                     row = cur.fetchone()
         except Exception as exc:
             raise MemoryStoreError(f"写入长期记忆失败: {exc}") from exc

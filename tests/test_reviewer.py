@@ -202,3 +202,52 @@ def test_missing_upstream_fails_without_model_call() -> None:
     assert result.error.code == "BAD_INPUT"
     assert result.error.retryable is False
     assert gateway.prompts == []
+
+
+# ------------------------------------------------- 判定规则由代码落实（复核后加固）
+
+
+def test_contradictory_model_output_is_ruled_by_code() -> None:
+    """verdict 以**代码规则**为准：模型自相矛盾（pass + unmet/blocker）时记 fail，
+    自报值单独留档在 model_verdict，便于发现模型输出问题。"""
+    gateway = CapturingGateway(
+        json.dumps(
+            {
+                "verdict": "pass",
+                "checks": [{"criterion": "c", "result": "unmet", "evidence": "e"}],
+                "issues": [{"severity": "blocker", "description": "d"}],
+                "confidence": 0.5,
+            }
+        )
+    )
+    result = asyncio.run(ReviewerAgent().invoke(_inv(), _ctx(gateway)))
+
+    assert result.outputs["verdict"] == "fail"
+    assert result.outputs["model_verdict"] == "pass"
+    assert result.outputs["blackboard_updates"][0]["status"] == "rejected"
+
+
+def test_model_fail_without_unmet_is_downgraded() -> None:
+    """模型报 fail 但 checks 全 met、只有 minor 问题：按规则降为 pass_with_issues。
+    规则写进提示词也必须有代码兜底，否则模型一句话就能把状态流转带偏。"""
+    gateway = CapturingGateway(
+        json.dumps(
+            {
+                "verdict": "fail",
+                "checks": [{"criterion": "c", "result": "met", "evidence": "e"}],
+                "issues": [{"severity": "minor", "description": "d"}],
+                "confidence": 0.5,
+            }
+        )
+    )
+    result = asyncio.run(ReviewerAgent().invoke(_inv(), _ctx(gateway)))
+
+    assert result.outputs["verdict"] == "pass_with_issues"
+    assert result.outputs["blackboard_updates"][0]["status"] == "validated"
+
+
+def test_verdict_fields_are_reported_for_every_pass() -> None:
+    """即使两侧一致，model_verdict 也在结果里（可观测性一致，便于统计模型偏差）。"""
+    gateway = CapturingGateway(_verdict_json("pass"))
+    result = asyncio.run(ReviewerAgent().invoke(_inv(), _ctx(gateway)))
+    assert result.outputs["verdict"] == result.outputs["model_verdict"] == "pass"

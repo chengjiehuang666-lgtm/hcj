@@ -235,7 +235,38 @@ class AnalysisPipeline:
         task_id: str,
         attempt: int = 1,
         visible_blackboard_keys: list[str] | None = None,
+        budget: Any = None,
     ) -> AgentInvocation:
+        """构造 AgentInvocation；预算**派生自任务预算且只能收紧**（冻结契约语义）。
+
+        独立复核发现：此前直接取 Settings 默认值，提交方在 TaskEvent.budget 里
+        收紧的额度被忽略（甚至比提交方要求的更宽）。预算的「熔断执行」属 W7，
+        但「逐级传递、只能收紧」是已冻结的契约语义，不在 W7。
+        """
+        max_tokens = self.settings.default_max_tokens
+        timeout_seconds = self.settings.default_task_timeout_seconds
+        if budget is not None:
+            # budget 可能是 Budget 契约对象（Planner 在图外跑时）或 state 里的
+            # 序列化 dict（图内节点——state 必须可 JSON 序列化，存不了对象）。
+            if isinstance(budget, dict):
+                event_tokens = int(budget.get("max_tokens") or max_tokens)
+                deadline = budget.get("deadline")
+                if isinstance(deadline, str):
+                    try:
+                        deadline = datetime.fromisoformat(deadline)
+                    except ValueError:
+                        deadline = None
+            else:
+                event_tokens = int(getattr(budget, "max_tokens", None) or max_tokens)
+                deadline = getattr(budget, "deadline", None)
+            max_tokens = min(max_tokens, event_tokens)
+            if isinstance(deadline, datetime):
+                try:
+                    remaining = int((deadline - datetime.now(TZ_CN)).total_seconds())
+                except TypeError:  # 无时区的 deadline：不敢猜，保持默认
+                    remaining = 0
+                if remaining > 0:
+                    timeout_seconds = min(timeout_seconds, remaining)
         return AgentInvocation(
             task_id=task_id,
             node_id=node_id,
@@ -244,8 +275,8 @@ class AnalysisPipeline:
             trace_id=task_id,
             input=inputs,
             budget=InvocationBudget(
-                max_tokens=self.settings.default_max_tokens,
-                timeout_seconds=self.settings.default_task_timeout_seconds,
+                max_tokens=max_tokens,
+                timeout_seconds=timeout_seconds,
             ),
             visible_blackboard_keys=list(visible_blackboard_keys or []),
         )
@@ -323,6 +354,16 @@ class AnalysisPipeline:
         )
 
     @staticmethod
+    def _dump_entry(entry: BlackboardEntry) -> dict[str, Any]:
+        """条目出网序列化：走 `to_wire`（exclude_none）。
+
+        不能用裸 `model_dump(mode="json")`：冻结 schema 里 `confidence` 只允许
+        number（无 null 分支），None 会序列化成 `"confidence": null` 被冻结契约拒绝
+        ——而 AgentResult.confidence 本身是可选的合法形态（独立复核实测复现）。
+        """
+        return to_wire(entry)
+
+    @staticmethod
     def _apply_blackboard_updates(
         current: dict[str, Any],
         updates: list[Any],
@@ -386,7 +427,7 @@ class AnalysisPipeline:
                 ),
                 written_at=datetime.now(TZ_CN),
             )
-            applied[key] = updated.model_dump(mode="json")
+            applied[key] = AnalysisPipeline._dump_entry(updated)
         return applied
 
     @staticmethod
@@ -435,9 +476,8 @@ class AnalysisPipeline:
                     ),
                     retryable=False,
                 )
-            entries[key] = AnalysisPipeline._new_entry(
-                key, inv, result, agent, written_at
-            ).model_dump(mode="json")
+            entry = AnalysisPipeline._new_entry(key, inv, result, agent, written_at)
+            entries[key] = AnalysisPipeline._dump_entry(entry)
 
         updates = (result.outputs or {}).get("blackboard_updates") or []
         if updates:
@@ -472,6 +512,7 @@ class AnalysisPipeline:
                 task_id=task_id,
                 # 契约字段落到实处：本节点能读到的黑板条目 = 直接上游写入的那些
                 visible_blackboard_keys=sorted(inputs.get("blackboard") or {}),
+                budget=(state.get("task_event") or {}).get("budget"),
             )
             result = await agent.invoke(inv, ctx)
             delta = self._absorb(
@@ -664,6 +705,7 @@ class AnalysisPipeline:
                 ),
             },
             task_id=task_id,
+            budget=event.budget,
         )
         result = await planner.invoke(inv, ctx)
         # 失败会抛 PipelineNodeFailed；Planner 在黑板书之前，current 传空
