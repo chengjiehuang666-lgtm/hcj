@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://multi-agent.internal/schemas/agent_io.schema.json",
+  "title": "AgentIO",
+  "description": "统一 Agent 调用契约。本文件同时定义两个结构：Orchestrator 用 AgentInvocation 调用任意专家 Agent，Agent 用 AgentResult 返回结果。任意 Agent 实现都必须同时满足这两个结构，与具体角色无关——角色差异体现在 SubtaskDAG 节点的 inputs/outputs 上，而不是体现在本契约上。",
+  "$defs": {
+    "AgentInvocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Orchestrator 调用专家 Agent 的请求结构。",
+      "required": [
+        "task_id",
+        "schema_version",
+        "node_id",
+        "attempt",
+        "agent_role",
+        "trace_id",
+        "input",
+        "budget"
+      ],
+      "properties": {
+        "task_id": { "type": "string" },
+        "schema_version": { "type": "string", "const": "1.0.0" },
+        "node_id": {
+          "type": "string",
+          "description": "对应 SubtaskDAG 中的节点 ID。"
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "本次调用是该节点的第几次尝试。与 task_id、node_id 共同构成幂等键。"
+        },
+        "agent_role": {
+          "type": "string",
+          "enum": ["retriever", "analyst", "reviewer", "writer"],
+          "description": "目标 Agent 角色。Orchestrator 据此路由到对应实现。"
+        },
+        "trace_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "全链路追踪 ID，与 task_id 一致或为其派生子 ID，用于贯穿网关→编排→Agent→模型→工具。"
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "节点输入。必须满足该节点在 SubtaskDAG 中声明的 inputs 契约。"
+        },
+        "visible_blackboard_keys": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "本节点可读的黑板条目 key 白名单，按最小权限授予，避免 Agent 越权读取无关上下文。"
+        },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["max_tokens", "timeout_seconds"],
+          "description": "本次调用的预算，派生自 TaskEvent.budget 且只能收紧。",
+          "properties": {
+            "max_tokens": { "type": "integer", "minimum": 1 },
+            "timeout_seconds": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    },
+    "AgentResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "专家 Agent 返回给 Orchestrator 的结果结构。",
+      "required": [
+        "task_id",
+        "schema_version",
+        "node_id",
+        "attempt",
+        "status",
+        "tokens_used",
+        "duration_ms"
+      ],
+      "properties": {
+        "task_id": { "type": "string" },
+        "schema_version": { "type": "string", "const": "1.0.0" },
+        "node_id": { "type": "string" },
+        "attempt": { "type": "integer", "minimum": 1 },
+        "status": {
+          "type": "string",
+          "enum": ["ok", "failed", "needs_human", "needs_replan"],
+          "description": "ok=成功；failed=失败（可重试与否见 error.retryable）；needs_human=需转人工（如置信度不足或触发 HITL）；needs_replan=当前拆解不可行，需 Planner 重规划。"
+        },
+        "outputs": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "产出物。status 为 ok 时必填，且必须满足该节点在 SubtaskDAG 中声明的 outputs 契约。"
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "本节点结果的置信度，供 Orchestrator 与 Reviewer 判断是否需要补检索或转人工。"
+        },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "description": "来源溯源。status 为 ok 时必填且不得为空——理由同 BlackboardEntry.sources。",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "ref"],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["sql", "document", "web", "model_inference", "human", "tool"]
+              },
+              "ref": { "type": "string", "minLength": 1 },
+              "timestamp": { "type": ["string", "null"], "format": "date-time" },
+              "retrieval_score": { "type": ["number", "null"] }
+            }
+          }
+        },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "message", "retryable"],
+          "description": "错误详情。status 为 failed 时必填。",
+          "properties": {
+            "code": {
+              "type": "string",
+              "description": "稳定错误码（机器可判别），如 SCHEMA_MISMATCH / SQL_ERROR / TIMEOUT / BUDGET_EXCEEDED。"
+            },
+            "message": { "type": "string" },
+            "retryable": {
+              "type": "boolean",
+              "description": "是否可重试。true 时 Orchestrator 按 max_retries 重试；false 时直接走降级或转人工。"
+            }
+          }
+        },
+        "blackboard_writes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "本次实际写入的黑板条目 key 列表，供审计与一致性核查（写入内容以黑板记录为准）。"
+        },
+        "tokens_used": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["input", "output", "total"],
+          "description": "本次调用的 Token 消耗，用于成本计量与预算熔断。",
+          "properties": {
+            "input": { "type": "integer", "minimum": 0 },
+            "output": { "type": "integer", "minimum": 0 },
+            "total": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "本节点耗时（毫秒）。"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "ok" } },
+            "required": ["status"]
+          },
+          "then": { "required": ["outputs", "sources"] }
+        },
+        {
+          "if": {
+            "properties": { "status": { "const": "failed" } },
+            "required": ["status"]
+          },
+          "then": { "required": ["error"] }
+        }
+      ]
+    }
+  }
+}

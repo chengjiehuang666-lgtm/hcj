@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://multi-agent.internal/schemas/task_event.schema.json",
+  "title": "TaskEvent",
+  "description": "渠道消息归一化后的标准任务事件。所有外部入口（REST / IM / Webhook / 控制台）必须先转换为本结构，方可进入编排层。这是全链路的起点，也是追踪主键的来源。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "schema_version",
+    "source",
+    "submitted_at",
+    "user",
+    "payload",
+    "sensitivity",
+    "budget"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "description": "全局唯一任务 ID（UUID v4）。全链路追踪与日志关联的主键。"
+    },
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0",
+      "description": "本契约的语义化版本。仅新增可选字段走小版本，语义变更或删除走大版本。"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channel"],
+      "properties": {
+        "channel": {
+          "type": "string",
+          "enum": ["rest_api", "web_console", "im_feishu", "im_dingtalk", "im_wecom", "ticket_webhook"],
+          "description": "消息来源渠道。本期只启用 rest_api，其余枚举项为预留。"
+        },
+        "channel_message_id": {
+          "type": "string",
+          "description": "渠道侧原始消息 ID，用于回执与去重。"
+        }
+      }
+    },
+    "submitted_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "任务提交时间（ISO 8601，含时区）。"
+    },
+    "user": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user_id", "roles"],
+      "properties": {
+        "user_id": { "type": "string", "minLength": 1 },
+        "display_name": { "type": "string" },
+        "roles": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "enum": ["business_user", "engineer", "reviewer", "admin"] },
+          "description": "发起人角色，用于权限判定与敏感操作的 HITL 路由。"
+        },
+        "tenant_id": {
+          "type": "string",
+          "default": "default",
+          "description": "租户标识。本期为单租户，固定为 default。"
+        }
+      }
+    },
+    "intent": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "由意图理解模块填充。入口阶段可为空，但进入编排前必须补齐 category。",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "意图分类，如 data_analysis / doc_generation / qa。本期主要为 data_analysis。"
+        },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "raw_text": { "type": "string" }
+      }
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["text"],
+      "description": "渠道原始内容归一化后的载荷。具体业务参数由各场景的输入契约细化。",
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "description": "用户自然语言诉求原文。"
+        },
+        "attachments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "uri"],
+            "properties": {
+              "name": { "type": "string" },
+              "uri": { "type": "string" },
+              "content_type": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "sensitivity": {
+      "type": "string",
+      "enum": ["public", "internal", "confidential", "restricted"],
+      "default": "internal",
+      "description": "敏感度分级。confidential 及以上必须触发输出脱敏，并在对外发送前经过 HITL 审批。"
+    },
+    "priority": {
+      "type": "string",
+      "enum": ["low", "normal", "high", "urgent"],
+      "default": "normal"
+    },
+    "context_ref": {
+      "type": ["string", "null"],
+      "description": "多轮会话 ID，用于上下文续接；单轮任务为 null。"
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_steps", "max_tokens", "max_retries", "deadline"],
+      "description": "执行预算。沿 SubtaskDAG → AgentInvocation 逐级传递且只能收紧，任何 Agent 不得放宽上游给定的额度。",
+      "properties": {
+        "max_steps": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30,
+          "description": "全任务最大执行步数，超限即熔断并转人工。"
+        },
+        "max_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 200000,
+          "description": "全任务 Token 上限（输入与输出合计）。默认值需依据评测集实测校准，见《实施路线图》待定项 D2。"
+        },
+        "max_retries": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 2,
+          "description": "单个子任务的最大重试次数。"
+        },
+        "deadline": {
+          "type": "string",
+          "format": "date-time",
+          "description": "绝对截止时间，超时即熔断。"
+        }
+      }
+    }
+  }
+}

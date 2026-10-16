@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://multi-agent.internal/schemas/blackboard_entry.schema.json",
+  "title": "BlackboardEntry",
+  "description": "黑板条目。Agent 之间不直接传递私有状态，一律通过黑板交换，黑板是单次任务内的唯一事实源（避免状态分叉）。写入采用条目级版本号乐观锁：写入方必须提交自己读到的 version，服务端比对，不一致即拒绝写入，由写入方重新读取后重试。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "schema_version",
+    "key",
+    "version",
+    "payload",
+    "written_by",
+    "written_at",
+    "status",
+    "sources"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "description": "所属任务 ID。"
+    },
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "key": {
+      "type": "string",
+      "pattern": "^[a-z0-9_]+\\.[a-z0-9_]+$",
+      "description": "条目键，命名约定 <node_id>.<output_name>，与 SubtaskDAG 中该节点 outputs 的字段名对应，便于机器校验归属。"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "条目级版本号，首次写入为 1，每次覆盖写入递增。乐观锁的比对依据。"
+    },
+    "payload": {
+      "description": "条目内容。必须符合产生它的节点在 SubtaskDAG 中声明的 outputs 契约；服务端写入前按该 Schema 校验，失败即拒绝。"
+    },
+    "written_by": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent_role", "agent_version", "node_id", "attempt"],
+      "description": "写入者身份，是「责任 Agent」可追溯性的落点。",
+      "properties": {
+        "agent_role": {
+          "type": "string",
+          "enum": ["retriever", "analyst", "reviewer", "writer", "system"]
+        },
+        "agent_version": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Agent 实现版本，必须包含 Prompt 版本。产品需求要求结论可回溯到「模型版本与责任 Agent」，本字段即该要求的载体。"
+        },
+        "node_id": {
+          "type": "string",
+          "description": "产出该条目的节点 ID。"
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "第几次尝试产出（重试计数），用于区分「重做后的结果」与原始结果。"
+        }
+      }
+    },
+    "written_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["draft", "validated", "rejected", "superseded"],
+      "description": "条目生命周期状态。draft 表示已写入但未经 Reviewer 抽检；validated 表示已通过校验；rejected 表示校验失败；superseded 表示已被新版本取代。"
+    },
+    "superseded_by": {
+      "type": ["string", "null"],
+      "description": "若被新版本取代，记录取代者的「key#version」。仅 status 为 superseded 时非空。"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "产出方自评置信度。低于阈值时应触发补检索或转人工（阈值配置见编排策略）。"
+    },
+    "ttl_seconds": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "description": "条目存活时长。null 表示随任务生命周期存续。"
+    },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "description": "来源溯源。产品需求要求「每个结论可回溯到来源数据、调用工具、模型版本与责任 Agent」，本字段是该要求的强制落点，不得为空。纯模型推理产生的结论也必须标注 model_inference 并给出模型名称与版本。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "ref"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["sql", "document", "web", "model_inference", "human", "tool"],
+            "description": "来源类型。"
+          },
+          "ref": {
+            "type": "string",
+            "minLength": 1,
+            "description": "引用位置。按类型分别填：SQL 语句哈希、文档 ID + 分块号、URL、模型名 + 版本、审批人 ID、工具调用 ID。"
+          },
+          "timestamp": {
+            "type": ["string", "null"],
+            "format": "date-time"
+          },
+          "retrieval_score": {
+            "type": ["number", "null"],
+            "description": "RAG 召回得分，仅 type 为 document 时有值。"
+          }
+        }
+      }
+    }
+  }
+}

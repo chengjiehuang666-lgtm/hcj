@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://multi-agent.internal/schemas/subtask_dag.schema.json",
+  "title": "SubtaskDAG",
+  "description": "Planner 输出的子任务图。Orchestrator 依据节点依赖就绪度推进调度。注意：JSON Schema 无法表达无环性，Orchestrator 收到本结构后必须额外校验三件事：(1) 依赖图无环；(2) 所有 depends_on 引用的 node_id 存在；(3) 所有节点自入口可达。任一校验失败应退回 Planner 重做，而不是带缺陷执行。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_id", "schema_version", "goal", "nodes", "created_at"],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "description": "对应 TaskEvent.task_id，保持全链路一致。"
+    },
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "goal": {
+      "type": "string",
+      "minLength": 1,
+      "description": "对原始需求的复述，供人工核对理解是否正确。"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1,
+      "description": "重规划次数。每次动态重规划递增，便于事后追溯「当时为什么这么拆」。"
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["node_id", "name", "agent_role", "depends_on", "inputs", "outputs", "acceptance"],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9_]+$",
+            "description": "图内唯一标识。命名建议 <角色>_<序号>，如 analyst_1。"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "人类可读的节点名称。"
+          },
+          "agent_role": {
+            "type": "string",
+            "enum": ["retriever", "analyst", "reviewer", "writer"],
+            "description": "负责执行该节点的 Agent 角色。注意：Planner 是本图的产出者而非节点，故不在枚举内。"
+          },
+          "depends_on": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": [],
+            "description": "前置节点 node_id 列表。空数组表示入口节点。"
+          },
+          "inputs": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "该节点的输入契约（JSON Schema 片段，或对黑板 key 的引用）。Orchestrator 在调度前据此校验上游产物是否齐备。"
+          },
+          "outputs": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "该节点的输出契约。产物写入黑板时必须通过此校验，失败即退回重做。"
+          },
+          "acceptance": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" },
+            "description": "可判定的验收标准，供 Reviewer 逐条核对。禁止写「结果合理」这类不可判定的描述。"
+          },
+          "requires_human_approval": {
+            "type": "boolean",
+            "default": false,
+            "description": "为 true 时，节点完成后必须经 HITL 阻塞点确认方可继续。涉及对外发送、资金/数据变更、文档签发的节点必须为 true。"
+          },
+          "timeout_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 300
+          },
+          "max_retries": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 2
+          }
+        }
+      }
+    }
+  }
+}
