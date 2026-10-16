@@ -66,6 +66,8 @@ def _outcome_to_result(outcome: PipelineOutcome) -> dict[str, Any]:
         "total_tokens": outcome.total_tokens,
         "duration_ms": outcome.duration_ms,
         "tokens_by_route": outcome.tokens_by_route,
+        # 本次任务沉淀进长期记忆的条目 id（未沉淀为 None；沉淀失败只影响该字段）
+        "memory_sunk": outcome.memory_sunk,
         "nodes": [
             {
                 "node_id": r.get("node_id"),

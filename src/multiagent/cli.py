@@ -72,6 +72,26 @@ def _print_outcome(outcome) -> int:
         if outputs.get("insufficient_data"):
             print("\n  ⚠ 模型判定数据不足以支撑结论")
 
+    # 文档场景（第 2 场景）：产物本体是文档
+    if any(r.get("agent_role") == "writer" for r in outcome.node_results):
+        document = outcome.merged_outputs_for_role("writer")
+        print(f"\n【文档】{document.get('title', '(无标题)')}")
+        print(document.get("document_markdown", ""))
+        for gap in document.get("material_gaps", []) or []:
+            print(f"  ⚠ 素材未涵盖：{gap}")
+
+    # 评审结论（reviewer 节点存在时）
+    if any(r.get("agent_role") == "reviewer" for r in outcome.node_results):
+        review = outcome.merged_outputs_for_role("reviewer")
+        print(
+            f"\n【评审】verdict = {review.get('verdict')}"
+            f"（问题 {review.get('issue_count', 0)} 个）"
+        )
+        for check in review.get("checks", []) or []:
+            print(f"  · [{check.get('result')}] {str(check.get('criterion'))[:60]}")
+        for issue in review.get("issues", []) or []:
+            print(f"  ⚠ [{issue.get('severity')}] {str(issue.get('description'))[:100]}")
+
     print("\n【黑板条目】")
     for key, entry in outcome.blackboard.items():
         by = entry.get("written_by") or {}

@@ -585,7 +585,8 @@ class AnalysisPipeline:
             return PipelineOutcome(
                 task_id=task_id,
                 status="failed",
-                error=f"[{exc.code}] {exc.message}",
+                # 带上节点名：只报错误码会让「哪个节点挂的」无从判断
+                error=f"[{exc.code}] 节点 {exc.node_id}: {exc.message}",
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 call_records=_serialize_call_records(router),
             )

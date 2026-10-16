@@ -264,7 +264,9 @@ CASES: list[EvalCase] = [
         # 与「重新跑了一遍 SQL 恰好得到相同数字」）。
         expect_memories=["华东"],
         requires_case="core_decline_cause",
-        expect_roles=["analyst", "reviewer"],
+        # 只要求评审在场；不要求 analyst——口径/回顾类问题有时会被 Planner 规划到
+        # 写作路径（writer→reviewer），那同样是合法链路，断言不应因此假失败
+        expect_roles=["reviewer"],
         note="跨会话用例：依赖 core_decline_cause 先沉淀记忆（runner 自动补齐前置用例）",
     ),
 ]

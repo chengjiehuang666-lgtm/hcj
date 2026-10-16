@@ -161,55 +161,89 @@ def _db_ready() -> None:
         pytest.skip(f"记忆表不可用: {exc}")
 
 
-def test_sink_search_dedup_and_clear() -> None:
+#: 测试专用的 task_id 前缀。**测试只清理自己的命名空间，绝不 clear() 整表**——
+#: 开发库里可能已有真实沉淀的记忆，全表清空会在跑一次 pytest 时把它们全抹掉
+#: （这个缺陷真的发生过：一轮单测消灭了前一晚评测沉淀的全部条目）。
+_TEST_PREFIX = "w6test-"
+
+
+def _purge_own() -> None:
+    import psycopg
+
+    with psycopg.connect(settings.postgres_dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM memory_entries WHERE task_id LIKE %s", (_TEST_PREFIX + "%",)
+            )
+
+
+def _test_entry(task_id: str) -> dict:
+    """构造带唯一探针标记的测试条目。
+
+    探针标记是必要的：开发库里可能有真实记忆，它们的内容同样会包含
+    「华东区」「20.85%」这类词，用业务词判断「测试条目是否被召回」会互相干扰。
+    """
+    entry = distill_memory(_outcome(nodes=[_ANALYST, _REVIEW_PASS], task_id=task_id))
+    assert entry is not None
+    entry["content"] += f"\n［探针 {task_id}］"
+    return entry
+
+
+def _probe(text: str, task_id: str) -> bool:
+    return f"探针 {task_id}" in text
+
+
+def test_sink_dedup_and_retrieval() -> None:
     _db_ready()
     store = _store()
-    store.clear()
+    _purge_own()
+    try:
+        entry = _test_entry(f"{_TEST_PREFIX}dedup")
+        memory_id = store.sink(entry)
+        assert memory_id is not None
 
-    entry = distill_memory(_outcome(nodes=[_ANALYST, _REVIEW_PASS]))
-    assert entry is not None
-    memory_id = store.sink(entry)
-    assert memory_id is not None
+        # 重复沉淀（同 task_id）按已有条目处理，不产生第二条
+        assert store.sink(entry) is None
 
-    # 重复沉淀（同 task_id）按已有条目处理，不产生第二条
-    assert store.sink(entry) is None
-    stats = store.stats()
-    assert stats == {"total": 1, "validated": 1}
-
-    hits = store.search("华东区销售额环比下降")
-    assert hits and hits[0].memory_id == memory_id
-    assert "20.85%" in hits[0].content
-    assert "t-1" in hits[0].source_ref
-
-    assert store.clear() == 1
-    assert store.search("华东区销售额环比下降") == []
+        # 检索命中：用探针标记查询、按 memory_id 断言——开发库可能还有真实记忆，
+        # 绝对计数断言会误伤
+        hits = store.search(f"探针 {_TEST_PREFIX}dedup", top_k=5)
+        mine = [h for h in hits if h.memory_id == memory_id]
+        assert mine, "本测试沉淀的条目必须在检索结果里"
+        assert "20.85%" in mine[0].content
+        assert f"{_TEST_PREFIX}dedup" in mine[0].source_ref
+    finally:
+        _purge_own()
 
 
 def test_search_only_returns_validated() -> None:
-    """draft/rejected 条目对后续会话不可见——评审未通过的东西不得回流。"""
+    """draft 条目对后续会话不可见——评审未通过的东西不得回流。"""
     _db_ready()
     import psycopg
 
     store = _store()
-    store.clear()
-    entry = distill_memory(_outcome(nodes=[_ANALYST, _REVIEW_PASS]))
-    assert entry is not None
-    store.sink(entry)
+    _purge_own()
+    try:
+        memory_id = store.sink(_test_entry(f"{_TEST_PREFIX}validated"))
+        assert memory_id is not None
 
-    # 直接插入一条 draft（模拟未经评审的条目）
-    with psycopg.connect(settings.postgres_dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO memory_entries (task_id, node_id, kind, content, "
-                "source_type, source_ref, status) VALUES "
-                "('t-draft', 'analyst_1', 'conclusion', '华东区销售额环比下降草稿', "
-                "'model_inference', '任务 t-draft', 'draft')"
-            )
+        # 直接插入一条 draft（模拟未经评审的条目），内容里放可识别的探针词
+        with psycopg.connect(settings.postgres_dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO memory_entries (task_id, node_id, kind, content, "
+                    "source_type, source_ref, status) VALUES "
+                    f"('{_TEST_PREFIX}draft', 'analyst_1', 'conclusion', "
+                    "'华东区销售额环比下降探针草稿', 'model_inference', '探针', 'draft')"
+                )
 
-    hits = store.search("华东区销售额环比下降")
-    assert len(hits) == 1 and hits[0].memory_id != 0
-    assert all("草稿" not in h.content for h in hits)
-    store.clear()
+        # top_k 放宽：开发库里可能有很多真实记忆挤占排名，本测试关心的是
+        # 「两条探针各自的可见性」，不是排序
+        hits = store.search("华东区销售额环比下降", top_k=50)
+        assert any(h.memory_id == memory_id for h in hits), "validated 条目应可见"
+        assert all("探针草稿" not in h.content for h in hits), "draft 条目不得回流"
+    finally:
+        _purge_own()
 
 
 def test_retriever_memory_mode(monkeypatch) -> None:
@@ -221,45 +255,54 @@ def test_retriever_memory_mode(monkeypatch) -> None:
     from multiagent.tools import SqlSandbox
 
     store = _store()
-    store.clear()
-    entry = distill_memory(_outcome(nodes=[_ANALYST, _REVIEW_PASS]))
-    assert entry is not None
-    store.sink(entry)
+    _purge_own()
+    try:
+        assert store.sink(_test_entry(f"{_TEST_PREFIX}retriever")) is not None
 
-    # Retriever 内部自建 MemoryStore：注入假 embedder 避免加载真模型
-    import multiagent.agents.retriever as retriever_module
+        # Retriever 内部自建 MemoryStore：注入假 embedder 避免加载真模型
+        import multiagent.agents.retriever as retriever_module
 
-    monkeypatch.setattr(
-        retriever_module, "MemoryStore", lambda s: MemoryStore(s, embedder=FakeEmbedder())
-    )
+        monkeypatch.setattr(
+            retriever_module, "MemoryStore", lambda s: MemoryStore(s, embedder=FakeEmbedder())
+        )
 
-    inv = AgentInvocation(
-        task_id="t-1",
-        node_id="retriever_3",
-        attempt=1,
-        agent_role="retriever",
-        trace_id="t-1",
-        input={"question": "上次分析华东区下滑的结论是什么", "mode": "memory"},
-        budget=InvocationBudget(max_tokens=1000, timeout_seconds=60),
-    )
-    ctx = AgentContext(
-        settings=settings,
-        gateway=None,  # memory 模式不调用模型
-        sandbox=SqlSandbox(settings),
-    )
-    result = asyncio.run(RetrieverAgent().invoke(inv, ctx))
+        inv = AgentInvocation(
+            task_id=f"{_TEST_PREFIX}retriever",
+            node_id="retriever_3",
+            attempt=1,
+            agent_role="retriever",
+            trace_id="t-1",
+            # 查询用探针标记：开发库里可能有大量相似的真实记忆，用业务词查询会
+            # 让本测试的条目挤不进 top_k，断言变成碰运气
+            input={"question": f"回顾探针 {_TEST_PREFIX}retriever", "mode": "memory"},
+            budget=InvocationBudget(max_tokens=1000, timeout_seconds=60),
+        )
+        ctx = AgentContext(
+            settings=settings,
+            gateway=None,  # memory 模式不调用模型
+            sandbox=SqlSandbox(settings),
+        )
+        result = asyncio.run(RetrieverAgent().invoke(inv, ctx))
 
-    assert result.status.value == "ok"
-    assert result.outputs["memory_count"] == 1
-    assert "20.85%" in result.outputs["memories"][0]["content"]
-    assert any("长期记忆:" in s.ref for s in result.sources)
-    assert result.blackboard_writes == ["retriever_3.memory"]
+        assert result.status.value == "ok"
+        assert result.outputs["memory_count"] >= 1
+        assert any(
+            _probe(m["content"], f"{_TEST_PREFIX}retriever")
+            for m in result.outputs["memories"]
+        ), "本测试沉淀的条目应在召回里"
+        assert any("长期记忆:" in s.ref for s in result.sources)
+        assert result.blackboard_writes == ["retriever_3.memory"]
 
-    store.clear()
-    result = asyncio.run(RetrieverAgent().invoke(inv, ctx))
-    assert result.outputs["memory_count"] == 0
-    # 未命中也是结果：必须有来源记录（契约要求 status=ok 时 sources 非空）
-    assert any("无命中" in s.ref for s in result.sources)
+        # 清掉自己的条目后重跑：探针内容不得再出现（开发库里可能有别的真实记忆，
+        # 因此用探针标记而不是业务词做判断）
+        _purge_own()
+        result = asyncio.run(RetrieverAgent().invoke(inv, ctx))
+        assert all(
+            not _probe(m["content"], f"{_TEST_PREFIX}retriever")
+            for m in result.outputs["memories"]
+        ), "已删除的条目不得再被召回"
+    finally:
+        _purge_own()
 
 
 # ---------------------------------------------------------------- 沉淀钩子（best-effort）

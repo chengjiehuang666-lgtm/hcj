@@ -145,9 +145,13 @@ class Settings(BaseSettings):
 
     # 单次模型调用的输出上限（reasoning 档）。
     # max_tokens 只是上限、不用不收费，所以给足以免被截断。
-    # 实测：推理型模型在「生成结构化 DAG」这类重推理任务上需 ~2,400 输出 token，
+    # 实测（云端 deepseek-flash）：生成结构化 DAG 这类重推理任务需 ~2,400 输出 token，
     # 4096 会因思考吃满而截断成空内容。
-    llm_max_output_tokens: int = 8192
+    # W6 扩到 16384：本地 cn:deepseek-v4.1-flash 思考更重——实测记忆回归用例的某次
+    # 调用思考消耗满 8192 仍无正文（finish_reason=length、内容为空），任务失败。
+    # 推理档的截断放宽重试**帮不上忙**（requested == cap 时不会放宽），所以上限本身
+    # 必须留足。
+    llm_max_output_tokens: int = 16384
 
     # fast 档的输出上限。**这是 fast 档延迟的主要控制点**，不是提示词长度。
     # 实测（输入完全相同，仅改上限）：
