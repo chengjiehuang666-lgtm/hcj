@@ -38,11 +38,37 @@
 
 | 依赖 | 当前状态 | 说明 |
 | :--- | :--- | :--- |
-| Python | ✅ 本机 3.13.7 | 文档原写 3.11；`requires-python = ">=3.11"`，3.13 实测可用 |
-| Docker | ❌ **未安装** | `C:\Program Files\Docker` 不存在。WSL2 + Ubuntu 可用，建议在 WSL 内装 Docker Engine |
-| WSL2 | ✅ 可用（Ubuntu，VERSION 2） | 可用于运行 Docker，或直接跑 PostgreSQL/Redis |
+| Python | ✅ 本机 3.13.7 | 已确认使用 3.13（文档原写 3.11）；`requires-python = ">=3.11"` |
+| Docker Desktop | ⚠️ **已安装，但 engine 无法运行** | 4.95.0，用户级安装于 `%LOCALAPPDATA%\Programs\DockerDesktop`；CLI v29.8.2 正常且在 PATH 中 |
+| WSL2 | ⚠️ **无法启动** | 报 `HCS_E_HYPERV_NOT_INSTALLED`，见下方「阻塞项」 |
 
-> Docker 未就绪前，`docker-compose.yml` 无法启动。但 **`LLM_MODE=stub` 时无需数据库即可跑通网关与契约测试**。
+### 🚧 阻塞项：Docker engine 起不来（需管理员 + 重启）
+
+诊断结论：**CPU 的 BIOS 虚拟化已经开启**（`VirtualizationFirmwareEnabled=True`），
+但 Windows 的虚拟化功能未启用（`HypervisorPresent=False`），因此 WSL2 无法启动，
+Docker Desktop 的 WSL2 后端也无法工作。Docker CLI 本身是好的，只是连不上 daemon
+（`failed to connect to the docker API at npipe:////./pipe/docker_engine`）。
+
+修复步骤（**以管理员身份**打开 PowerShell 或 CMD）：
+
+```bat
+dism /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+dism /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
+```
+
+然后**重启电脑**，启动 Docker Desktop，再用 `docker info` 确认 daemon 已就绪。
+
+> 在 Docker 未就绪前，`docker-compose.yml` 无法启动。但**契约测试与网关测试都不需要它**
+> （`pytest -q` 或 `python tests/test_gateway.py` 可直接跑），模型调用走 `LLM_MODE=live` 也不需要数据库。
+
+## 已知限制
+
+1. **主备模型同源**：当前 `.env` 中主力与备用都是 `deepseek-flash`（同一供应商、同一端点）。
+   此时降级只对「模型级」故障有效（如配额、模型下线），**对供应商整体故障无效**——
+   DeepSeek 一旦不可用，两者会一起失败。真正的供应商级failover需要第二个厂商的 key
+   （通义千问 / 智谱 GLM，均为 OpenAI 兼容接口，只需改 `.env` 三行）。
+   同端点下可退而求其次把备用设为 `deepseek-v4-pro`，至少能规避单模型级的容量问题。
+2. **无远端仓库**：回档能力目前仅限本机（见《实施路线图》风险 R12）。
 
 ## 快速开始
 
