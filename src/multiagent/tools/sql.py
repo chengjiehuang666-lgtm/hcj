@@ -181,6 +181,65 @@ class SqlSandbox:
         except Exception as exc:
             raise SqlExecutionError(f"读取表结构失败: {exc}") from exc
 
+    def describe_data_ranges(self) -> dict[str, dict[str, Any]]:
+        """返回每张表中日期/时间列的**实际取值范围**与行数。
+
+        为什么需要：模型只看得到「当前时间」，看不到「数据覆盖哪段时间」，
+        于是会凭空假设年份（评测中曾写出 `stat_date = '2025-08-01'` 这类条件，
+        聚合结果全为 NULL，导致无法给出结论）。把真实范围喂给模型是必需的。
+
+        表名与列名来自 information_schema（非用户输入），但仍按白名单字符校验
+        后再拼进 SQL，避免意外的标识符注入。
+        """
+        import psycopg
+        from psycopg.rows import dict_row
+
+        identifier = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+        temporal_types = {
+            "date",
+            "timestamp without time zone",
+            "timestamp with time zone",
+        }
+        columns = [
+            c
+            for c in self.describe_schema()
+            if c["data_type"] in temporal_types
+            and identifier.match(c["table_name"])
+            and identifier.match(c["column_name"])
+        ]
+
+        ranges: dict[str, dict[str, Any]] = {}
+        try:
+            with psycopg.connect(
+                self._dsn, connect_timeout=self._timeout, row_factory=dict_row
+            ) as conn:
+                with conn.cursor() as cur:
+                    for col in columns:
+                        table, column = col["table_name"], col["column_name"]
+                        cur.execute(
+                            f'SELECT MIN("{column}")::text AS min_value, '
+                            f'MAX("{column}")::text AS max_value, '
+                            f'COUNT(*) AS row_count FROM "{table}"'
+                        )
+                        row = cur.fetchone()
+                        ranges.setdefault(table, {})[column] = dict(row)
+        except Exception as exc:
+            raise SqlExecutionError(f"读取数据时间范围失败: {exc}") from exc
+        return ranges
+
+    def data_ranges_as_prompt_text(self) -> str:
+        ranges = self.describe_data_ranges()
+        if not ranges:
+            return "（未发现日期/时间列）"
+        lines = []
+        for table, columns in ranges.items():
+            for column, info in columns.items():
+                lines.append(
+                    f"- {table}.{column}: {info['min_value']} ~ {info['max_value']}"
+                    f"（共 {info['row_count']} 行）"
+                )
+        return "\n".join(lines)
+
     def schema_as_prompt_text(self) -> str:
         grouped: dict[str, list[str]] = {}
         for col in self.describe_schema():

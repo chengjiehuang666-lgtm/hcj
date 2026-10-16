@@ -46,6 +46,7 @@ class PipelineState(TypedDict, total=False):
     task_event: dict[str, Any]
     now: str
     schema: str
+    data_ranges: str
     metric_definitions: dict[str, Any]
     dag: dict[str, Any]
     blackboard: dict[str, Any]
@@ -147,6 +148,7 @@ class AnalysisPipeline:
         elif inv.agent_role == "retriever":
             merge["schema"] = result.outputs.get("schema", "")
             merge["metric_definitions"] = result.outputs.get("metric_definitions", {})
+            merge["data_ranges"] = result.outputs.get("data_ranges", "")
         elif inv.agent_role == "analyst":
             merge["summary"] = result.outputs.get("summary", "")
         return merge
@@ -182,14 +184,24 @@ class AnalysisPipeline:
         async def analyze_node(state: PipelineState) -> dict:
             task_id = state["task_event"]["task_id"]
             question = state["task_event"]["payload"]["text"]
+            # 把 Planner 为该节点写的验收标准传给取数环节：
+            # 否则「写 SQL 的一步」不知道「下结论的一步」需要哪些维度和基期数据。
+            acceptance = [
+                criterion
+                for node in (state.get("dag") or {}).get("nodes", [])
+                if node.get("node_id") == "analyst_1"
+                for criterion in node.get("acceptance", [])
+            ]
             inv = self._make_invocation(
                 "analyst_1",
                 "analyst",
                 {
                     "question": question,
                     "schema": state.get("schema", ""),
+                    "data_ranges": state.get("data_ranges", ""),
                     "metric_definitions": state.get("metric_definitions", {}),
                     "now": state["now"],
+                    "acceptance": acceptance,
                 },
                 task_id=task_id,
             )

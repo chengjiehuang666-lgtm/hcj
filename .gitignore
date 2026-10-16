@@ -92,3 +92,6 @@ coverage/
 *.tfstate
 *.tfstate.*
 kubeconfig
+
+# ===== 评测运行的原始产物（基线结论会沉淀进《实施路线图》3.7）=====
+eval_results/

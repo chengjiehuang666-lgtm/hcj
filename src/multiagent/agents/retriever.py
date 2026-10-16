@@ -33,6 +33,9 @@ class RetrieverAgent(BaseAgent):
         try:
             result = ctx.sandbox.execute(_METRICS_SQL)
             schema = ctx.sandbox.schema_as_prompt_text()
+            # 数据实际覆盖的时间范围必须取出来给下游：否则取数环节会凭空假设年份，
+            # 写出落在真实数据范围之外的日期条件，聚合结果全为 NULL。
+            data_ranges = ctx.sandbox.data_ranges_as_prompt_text()
         except SqlToolError as exc:
             code, retryable = self.classify_error(exc)
             return self.failed(
@@ -59,6 +62,7 @@ class RetrieverAgent(BaseAgent):
             outputs={
                 "metric_definitions": definitions,
                 "schema": schema,
+                "data_ranges": data_ranges,
                 "metric_count": len(definitions),
             },
             sources=[
