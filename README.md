@@ -27,8 +27,17 @@
 ├── src/multiagent/            # 应用代码
 │   ├── config.py              # 配置（pydantic-settings，读 .env）
 │   ├── contracts/             # 契约的 Pydantic 实现，与接口契约一一对应
-│   └── gateway/               # 大模型网关（供应商无关 + 降级）
-├── tests/                     # 契约一致性测试、网关测试
+│   ├── gateway/               # 大模型网关（供应商无关 + 降级 + 分级路由）
+│   ├── agents/                # 专家 Agent：planner / retriever / analyst / reviewer / writer
+│   ├── graph/                 # 编排层：由 Planner 的 DAG 在运行时驱动构图与执行
+│   ├── tools/                 # SQL 沙箱（只读角色）与 Python 沙箱（容器隔离）
+│   ├── rag/                   # 知识库：本地 embedding + pgvector + pg_trgm 混合检索
+│   ├── memory/                # 长期记忆：评审门槛后沉淀、跨会话检索（与知识库分表）
+│   ├── eval/                  # 评测集与执行器（27 条用例 + 打分器）
+│   ├── api/                   # REST + SSE 入口
+│   └── cli.py                 # 命令行入口
+├── tests/                     # 契约一致性、引擎、Agent、记忆、网关等单测
+├── docker/initdb/             # PG 初始化 SQL（扩展 / 演示数据 / 知识库 / 记忆）
 ├── docker-compose.yml         # PostgreSQL(pgvector) + Redis
 ├── .env.example               # 环境变量模板（真实密钥放 .env，不入库）
 └── pyproject.toml
@@ -38,61 +47,35 @@
 
 | 依赖 | 当前状态 | 说明 |
 | :--- | :--- | :--- |
-| Python | ✅ 本机 3.13.7 | 已确认使用 3.13（文档原写 3.11）；`requires-python = ">=3.11"` |
-| Docker Desktop | ⚠️ **已安装，但 engine 无法运行** | 4.95.0，用户级安装于 `%LOCALAPPDATA%\Programs\DockerDesktop`；CLI v29.8.2 正常且在 PATH 中 |
-| WSL2 | ⚠️ **无法启动** | 报 `HCS_E_HYPERV_NOT_INSTALLED`，见下方「阻塞项」 |
-
-### 🚧 阻塞项：Docker engine 起不来（需管理员 + 重启）
-
-诊断结论：**CPU 的 BIOS 虚拟化已经开启**（`VirtualizationFirmwareEnabled=True`），
-但 Windows 的虚拟化功能未启用（`HypervisorPresent=False`），因此 WSL2 无法启动，
-Docker Desktop 的 WSL2 后端也无法工作。Docker CLI 本身是好的，只是连不上 daemon
-（`failed to connect to the docker API at npipe:////./pipe/docker_engine`）。
-
-修复步骤（**以管理员身份**打开 PowerShell 或 CMD）：
-
-```bat
-dism /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
-dism /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
-```
-
-然后**重启电脑**，启动 Docker Desktop，再用 `docker info` 确认 daemon 已就绪。
-
-> 在 Docker 未就绪前，`docker-compose.yml` 无法启动。但**契约测试与网关测试都不需要它**
-> （`pytest -q` 或 `python tests/test_gateway.py` 可直接跑），模型调用走 `LLM_MODE=live` 也不需要数据库。
+| Python | ✅ 本机 3.13.7 | 已确认使用 3.13；`requires-python = ">=3.11"` |
+| Docker Desktop | ✅ 运行中 | PostgreSQL 16 + pgvector、Redis 7 两个容器 healthy |
+| 模型端点 | ✅ 本地端点 127.0.0.1:7863 | reasoning 档主力与 fast 档都走本地；见「已知限制」 |
 
 ## 已知限制
 
-1. **本地端点同时承担两个角色，是当前的可用性单点**：`.env` 中
-   - reasoning 档：主 = DeepSeek `deepseek-flash`（推理型），备 = 本地 `glm-5.3`（非推理型）
-   - fast 档：主 = 本地 `glm-5.3`，备 = DeepSeek `deepseek-flash`
+1. **模型端点拓扑与质量边界**（2026-10-16 W6 收尾更新）：
+   - reasoning 档：主 = 本地 `cn:deepseek-v4.1-flash`（推理型），备 = 本地 `glm-5.3`
+   - fast 档：主 = 本地 `glm-5.3`，备 = 云端 `deepseek-flash`
 
-   即本地端点既是 reasoning 档的备用，又是 fast 档的主力。
-   **本地服务不可用时不会失败**：fast 档会自动降级到 DeepSeek，只是时延回退到推理型水平。
-
-   另注：智谱**官方**端点（`https://open.bigmodel.cn/api/paas/v4`）的账号**余额为 0**，
-   调用返回 `HTTP 429 / code 1113「余额不足或无可用资源包」`（key 本身有效，
-   `GET /models` 返回 200）。因此备用没有指向官方端点，而是指向了本地服务。
-   若想恢复官方端点作为备用，需先充值。
+   原先的云端 deepseek 主模型**余额耗尽**（HTTP 402），已整体切到本地端点；
+   **切换只改了 `.env`，没有改代码**。备选端点 glm-5.3 的真实质量边界已被观测：
+   它在**规划类**任务上不可靠（会产出 node_id 与 role 不一致的畸形 DAG，被规划门禁
+   拦下），适合作为快速档/兜底，不适合承担规划与归因。两个档位的主备都指向同一个
+   本地端点，因此**本地服务是可用性单点**。
 2. **无远端仓库**：回档能力目前仅限本机（见《实施路线图》风险 R12）。
-3. **时延与成功率相互牵制，本轮选择「保质量」**：
-   - **✅ 成功率 24/24 = 100%**（引入知识库 RAG 后由 85% 回升），远超 M1 的 80% 门槛
-   - ⚠️ **P95 端到端时延 74.3 秒**，重新超过 M1 的 60 秒目标（P50 30.8 秒仍达标）
-   - 原因：知识片段同时进入取数与归因两个提示词，平均 token 从 5,659 升到 8,903；
-     但正是这个变化治好了原先失败的用例——**RAG 用「时延」换「质量」**
+3. **时延与成功率相互牵制，W6 明码选择「保质量」**：
+   - **✅ 成功率 27/27 = 100%**（24 条分析 + 2 条文档 + 1 条跨会话记忆，全量回归见路线图 §3.11）
+   - ⚠️ 引入 Reviewer 强制交叉校验后时延显著上升（P50 31.8→70.7 秒、平均 token
+     9.7k→21.7k），reviewer 占模型调用耗时 48%——这是「强制必审」的明码代价，
+     如实记录、不追时延
+4. **推理型模型的 `max_tokens` 是「共享额度」**：推理模型会先产生思考 token 再产生
+   正文，`max_tokens` 由两者共享。额度偏小时思考会吃满全部额度，导致正文为空且
+   `finish_reason=length`（W6 实测：本地 `cn:deepseek-v4.1-flash` 某次调用思考消耗
+   满 8192 仍无正文，任务失败；上限已扩至 16384）。
 
-   三轮实测对比与超时用例清单见《实施路线图》3.7 与 3.9。
-
-   **下一步候选手段**：压缩知识片段预算（4 段 × 400 字符 × 两个提示词）、
-   降低 SQL 修补轮触发率。遵循「先量后改」，不盲调。
-4. **推理型模型的 `max_tokens` 是「共享额度」**：`deepseek-flash` 会先产生
-   `reasoning_content` 再产生 `content`，而 `max_tokens` **由两者共享**。额度偏小时
-   思考会吃掉全部额度，导致 `content` 为空且 `finish_reason=length`
-   （实测同一句请求：`max_tokens=20` 全被思考消耗、输出为空；`512` 时才正常返回）。
-
-   网关对此**显式报错**（`EmptyCompletionError`，提示调大 `max_tokens`），
-   不会静默返回空字符串——静默失败会让上游误以为模型「没话说」。
-   `LLMResponse.reasoning_tokens` 单独记录了思考 token，供成本计量使用。
+   网关对此**显式报错**（`EmptyCompletionError`），不会静默返回空字符串——
+   静默失败会让上游误以为模型「没话说」。`LLMResponse.reasoning_tokens` 单独记录了
+   思考 token，供成本计量使用。
 
 ## 快速开始
 
@@ -106,12 +89,26 @@ python -m venv .venv
 # Windows: .venv\Scripts\activate      Git Bash: source .venv/Scripts/activate
 pip install -e ".[dev]"
 
-# 3. 跑测试（契约一致性 + 网关降级）
+# 3. 跑测试（契约一致性 + 网关降级 + 引擎/Agent/记忆）
+#    数据库不可达时相关用例自动跳过；记忆相关用例只操作 w6test- 命名空间，
+#    不会动开发库里真实沉淀的数据
 pytest -q
 
 # 4. 启动依赖服务（需先有 Docker）
 docker compose up -d
+
+# 5. 灌知识库（首次或数据卷重建后）
+python -m multiagent.rag.ingest --stats
+
+# 6. 跑一条端到端任务 / 评测回归
+python -m multiagent.cli "分析上月华东区销售额下滑的原因"
+python -m multiagent.eval.runner --limit 3        # 全量 27 条约 45 分钟
+python -m multiagent.memory --stats               # 长期记忆维护（--search / --clear）
 ```
+
+> 已有数据卷的环境**不会**自动执行新增的初始化 SQL（initdb 只在空卷跑一次）。
+> 新增脚本需手工执行，例如长期记忆表：
+> `docker exec -i ma-postgres psql -U multiagent -d multiagent < docker/initdb/04-memory-schema.sql`
 
 ## 开发约定
 
