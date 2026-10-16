@@ -64,13 +64,23 @@ data/processed/
 *.sqlite3
 *.db
 uploads/
-storage/
-cache/
+/storage/
+/cache/
 
 # ===== 模型与向量库本地数据 =====
-models/
+# 注意：凡是可能同时是源码包名的目录（models/storage/cache），必须加前导 /
+# 锚定到仓库根。否则 `models/` 会连 backend/app/models/ 一起忽略，
+# 导致 ORM 数据模型层永远提交不进仓库。
+/models/
+model_weights/
 *.bin
+*.safetensors
+*.onnx
+*.pt
+*.pth
 *.gguf
+.cache/huggingface/
+huggingface/
 milvus_data/
 pgdata/
 redis_data/

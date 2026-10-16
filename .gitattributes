@@ -1,0 +1,53 @@
+# 统一行尾策略：仓库内一律 LF，杜绝 Windows 开发、Linux 容器部署之间的 CRLF 差异。
+# 背景：本机 core.autocrlf=true，部署目标是 K8s/Linux；没有此文件时 .sh 与 Dockerfile
+# 会被带成 CRLF，在容器内报 "\r: command not found"。
+
+* text=auto
+
+# 脚本 / 容器 / 编排文件：强制 LF（工作区也是 LF）
+*.sh            text eol=lf
+*.bash          text eol=lf
+*.zsh           text eol=lf
+Dockerfile      text eol=lf
+Dockerfile.*    text eol=lf
+*.dockerfile    text eol=lf
+Makefile        text eol=lf
+*.mk            text eol=lf
+*.yaml          text eol=lf
+*.yml           text eol=lf
+*.toml          text eol=lf
+*.sql           text eol=lf
+
+# Windows 原生脚本：保持 CRLF
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+*.ps1           text eol=crlf
+
+# 二进制：不转换行尾、不做文本 diff
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.tar   binary
+*.bin   binary
+*.gguf  binary
+*.safetensors binary
+*.onnx  binary
+*.pt    binary
+*.pth   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.xlsx  binary
+*.docx  binary
+*.pptx  binary
+
+# 文档与锁文件：参与文本 diff，便于审查
+*.md    text
+*.json  text
+*.lock  text
