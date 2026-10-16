@@ -31,11 +31,23 @@ FAKE_RESULT_OUTPUTS = {
 
 
 class FakePipeline:
-    """模拟流水线：发出与真实链路相同的节点事件，返回构造好的 outcome。"""
+    """模拟流水线：发出与真实链路相同的节点事件，返回构造好的 outcome。
 
-    def __init__(self, settings, on_event=None, *, should_fail: bool = False) -> None:
+    `with_review=True` 时追加 W6 的 reviewer 节点与黑板变更事件，
+    用于断言 SSE 与结果里能观察到评审链路（不依赖真实模型）。
+    """
+
+    def __init__(
+        self,
+        settings,
+        on_event=None,
+        *,
+        should_fail: bool = False,
+        with_review: bool = False,
+    ) -> None:
         self._on_event = on_event
         self._should_fail = should_fail
+        self._with_review = with_review
 
     async def run(self, event):
         if self._on_event:
@@ -53,24 +65,67 @@ class FakePipeline:
                     "node_finished",
                     {"node_id": node_id, "agent_role": role, "status": "ok", "tokens": 100},
                 )
+            if self._with_review:
+                await self._on_event(
+                    "node_started", {"node_id": "reviewer_1", "agent_role": "reviewer"}
+                )
+                await self._on_event(
+                    "blackboard_written",
+                    {
+                        "key": "analyst_1.report",
+                        "version": 2,
+                        "status": "validated",
+                        "written_by": {
+                            "agent_role": "reviewer",
+                            "agent_version": "0.1.0",
+                            "node_id": "reviewer_1",
+                            "attempt": 1,
+                        },
+                        "node_id": "reviewer_1",
+                        "agent_role": "reviewer",
+                    },
+                )
+                await self._on_event(
+                    "node_finished",
+                    {"node_id": "reviewer_1", "agent_role": "reviewer", "status": "ok", "tokens": 50},
+                )
         if self._should_fail:
             raise RuntimeError("模拟流水线崩溃")
+        node_results = [
+            {
+                "node_id": "analyst_1",
+                "agent_role": "analyst",
+                "status": "ok",
+                "duration_ms": 1000,
+                "tokens_used": {"input": 100, "output": 221, "total": 321},
+                "outputs": FAKE_RESULT_OUTPUTS,
+            }
+        ]
+        if self._with_review:
+            node_results.append(
+                {
+                    "node_id": "reviewer_1",
+                    "agent_role": "reviewer",
+                    "status": "ok",
+                    "duration_ms": 500,
+                    "tokens_used": {"input": 40, "output": 30, "total": 70},
+                    "outputs": {
+                        "verdict": "pass",
+                        "issue_count": 0,
+                        "issues": [],
+                        "checks": [
+                            {"criterion": "结论有 SQL 支撑", "result": "met", "evidence": "x"}
+                        ],
+                    },
+                }
+            )
         return PipelineOutcome(
             task_id=str(event.task_id),
             status="ok",
             summary=FAKE_RESULT_OUTPUTS["summary"],
             total_tokens=321,
             duration_ms=1234,
-            node_results=[
-                {
-                    "node_id": "analyst_1",
-                    "agent_role": "analyst",
-                    "status": "ok",
-                    "duration_ms": 1000,
-                    "tokens_used": {"input": 100, "output": 221, "total": 321},
-                    "outputs": FAKE_RESULT_OUTPUTS,
-                }
-            ],
+            node_results=node_results,
             call_records=[
                 {"route": "planner", "provider": "fake", "ok": True,
                  "input_tokens": 10, "output_tokens": 20, "total_tokens": 30, "duration_ms": 100}
@@ -198,6 +253,34 @@ def test_streaming_after_completion_replays_buffered_events() -> None:
     # planner（图外）+ 两路并行检索 + 分析
     assert payload.count("event: node_finished") == 4
     assert "task_finished" in payload
+
+
+def test_events_and_result_expose_reviewer_and_blackboard() -> None:
+    """W6：SSE 里能看到 reviewer 节点与黑板变更事件；接口结果里带评审结论。
+
+    这条是「评审链路对观测面可见」的确定性测试——不依赖真实模型与数据库。
+    """
+    app = create_app(
+        settings=Settings(_env_file=None),
+        pipeline_factory=lambda s, on_event: FakePipeline(s, on_event, with_review=True),
+    )
+    client = TestClient(app)
+    task_id = client.post("/tasks", json={"question": "q"}).json()["task_id"]
+    body = _wait_finished(client, task_id)
+
+    assert body["status"] == "ok"
+    # 结果里暴露评审结论（能不能采信是 verdict 说了算）
+    assert body["result"]["review"]["verdict"] == "pass"
+    assert body["result"]["review"]["issue_count"] == 0
+
+    with client.stream("GET", f"/tasks/{task_id}/events") as response:
+        payload = "".join(response.iter_text())
+
+    assert '"agent_role": "reviewer"' in payload
+    assert "event: blackboard_written" in payload
+    # 黑板事件要带 key 与版本，订阅方才能据此判断「哪条、第几版」
+    assert '"key": "analyst_1.report"' in payload
+    assert '"version": 2' in payload and '"status": "validated"' in payload
 
 
 def test_every_event_is_valid_sse_with_json_data() -> None:
