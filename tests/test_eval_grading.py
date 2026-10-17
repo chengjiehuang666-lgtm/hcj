@@ -201,39 +201,57 @@ def test_multiple_expected_docs_accept_any_match() -> None:
     assert passed, failed
 
 
-# --------------------------------------------------------- 记忆的来源绑定（A）
+# --------------------------------------------------------- 记忆用例门槛（A）
 
 
-def test_memory_binding_requires_source_from_this_run() -> None:
-    """记忆断言必须绑定**本次运行**：历史沉淀满足子串也不能算通过。
+def test_grade_memory_expectation_is_retrieval_structural() -> None:
+    """grade 的记忆断言只查「召回里是否有预期内容」（结构性证据）。"""
+    case = EvalCase(id="mem", question="q", expect_memories=["华东"])
+    hit = FakeOutcome(memories=[{"content": "华东区下滑", "source_ref": "任务 x"}])
+    assert grade(case, hit)[0] is True
+    miss = FakeOutcome(memories=[{"content": "华南区稳定", "source_ref": "任务 y"}])
+    passed, failed, _, _ = grade(case, miss)
+    assert passed is False and any("记忆:华东" in f for f in failed)
 
-    独立复核发现：只断言「命中含华东」时，开发库里积累的历史记忆会让用例假绿——
-    沉淀链路坏掉也照样通过。绑定到前置用例本次运行的 task_id 才有牙齿。
+
+def test_memory_source_problem_requires_producer_sink() -> None:
+    """前置用例的沉淀结果必须真的落库：断言查前置用例的 memory_sunk。
+
+    这条门槛不能绑成「召回里含前置用例的 task_id」——那取决于检索排名，
+    相似历史记忆一多就不保证进 top-k（W6 修复首版因此误判，已改正）。
     """
+    from multiagent.eval.runner import CaseResult, _memory_source_problem
+
     case = EvalCase(
-        id="mem",
-        question="q",
-        expect_memories=["华东"],
-        memory_source_case="producer",
+        id="mem", question="q", expect_memories=["华东"], memory_source_case="producer"
     )
-    fresh = FakeOutcome(
-        memories=[{"content": "华东区下滑", "source_ref": "任务 run-1，SQL sha256:x"}]
+
+    def result(case_id: str, sunk: int | None) -> CaseResult:
+        return CaseResult(
+            case_id=case_id,
+            question="q",
+            passed=True,
+            status="ok",
+            latency_ms=1,
+            tokens=1,
+            input_tokens=1,
+            output_tokens=0,
+            memory_sunk=sunk,
+        )
+
+    assert _memory_source_problem(case, [result("producer", 42)]) is None
+    assert (
+        _memory_source_problem(case, [result("producer", None)])
+        == "前置用例未沉淀:producer"
     )
-    assert grade(case, fresh, memory_source_task_id="run-1")[0] is True
-
-    # 内容含「华东」但来自历史任务（非本次运行）→ 必须失败
-    stale = FakeOutcome(
-        memories=[{"content": "华东区下滑", "source_ref": "任务 old-run，SQL sha256:y"}]
+    assert (
+        _memory_source_problem(case, [])
+        == "前置用例未运行:producer"
     )
-    passed, failed, _, _ = grade(case, stale, memory_source_task_id="run-1")
-    assert passed is False
-    assert any("未绑定本次运行" in f for f in failed), failed
 
-    # 前置用例根本没跑 → 明确报「前置用例未运行」而不是静默通过
-    passed2, failed2, _, _ = grade(case, stale, memory_source_task_id=None)
-    assert passed2 is False
-    assert any("前置用例未运行" in f for f in failed2), failed2
 
-    # 未声明来源绑定的用例不受影响（向后兼容）
-    plain = EvalCase(id="mem2", question="q", expect_memories=["华东"])
-    assert grade(plain, stale, memory_source_task_id="run-1")[0] is True
+def test_memory_source_problem_noop_without_binding() -> None:
+    from multiagent.eval.runner import _memory_source_problem
+
+    plain = EvalCase(id="mem", question="q", expect_memories=["华东"])
+    assert _memory_source_problem(plain, []) is None

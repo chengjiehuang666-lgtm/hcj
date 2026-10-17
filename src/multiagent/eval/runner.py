@@ -129,21 +129,31 @@ def _retrieved_memories(outcome) -> list[str]:
     return texts
 
 
-def _retrieved_memory_refs(outcome) -> list[str]:
-    """汇总所有 retriever 节点取到的长期记忆**来源出处**（用于绑定本次运行）。"""
-    refs: list[str] = []
-    for res in _nodes_by_role(outcome, "retriever"):
-        for item in (res.get("outputs") or {}).get("memories", []) or []:
-            refs.append(str(item.get("source_ref", "")))
-    return refs
-
-
 def _writer_outputs(outcome) -> dict:
     """写作节点的产物（多节点时按顺序合并）。"""
     merged: dict = {}
     for res in _nodes_by_role(outcome, "writer"):
         merged.update(res.get("outputs") or {})
     return merged
+
+
+def _memory_source_problem(case: EvalCase, results: list[CaseResult]) -> str | None:
+    """记忆用例的前置条件：它依赖的前置用例必须本次**真的沉淀**。
+
+    这条断言必须查前置用例的 `memory_sunk`，而不是当前用例召回内容的来源——
+    召回是否包含某条特定记忆取决于**检索排名**（相似历史记忆一多就不保证进
+    top-k），那是产品没承诺的性质；而「沉淀链路是否工作」是本次交付必须守住的。
+    """
+    if not case.memory_source_case:
+        return None
+    producer = next(
+        (r for r in results if r.case_id == case.memory_source_case), None
+    )
+    if producer is None:
+        return f"前置用例未运行:{case.memory_source_case}"
+    if producer.memory_sunk is None:
+        return f"前置用例未沉淀:{case.memory_source_case}"
+    return None
 
 
 def _review_summary(outcome) -> tuple[str | None, int | None]:
@@ -157,17 +167,13 @@ def _review_summary(outcome) -> tuple[str | None, int | None]:
     return outputs.get("verdict"), outputs.get("issue_count")
 
 
-def grade(
-    case: EvalCase,
-    outcome,
-    *,
-    memory_source_task_id: str | None = None,
-) -> tuple[bool, list[str], list[str], bool]:
+def grade(case: EvalCase, outcome) -> tuple[bool, list[str], list[str], bool]:
     """返回 (是否通过, 未命中的检查项, 命中的禁用词, 是否判定数据不足)。
 
-    `memory_source_task_id`：`memory_source_case` 所指前置用例**本次运行**的
-    task_id。记忆用例要求召回来自它——开发库里积累的历史沉淀随时可满足子串断言，
-    只有绑定到本次运行，沉淀链路坏掉时用例才会真失败（独立复核确认的缺口）。
+    注意：记忆用例「前置用例真的沉淀了」这一断言不在这里——沉淀结果挂在**前置
+    用例**的 CaseResult 上，由 run_cases 校验（见 `_memory_source_problem`）。
+    此前试过把断言绑成「召回里要有前置用例本次 task_id」：它依赖检索排名，库里
+    相似历史记忆一多就不保证进 top-k，属于把产品没承诺的排序性质当门槛。
     """
     outputs = _analyst_outputs(outcome)
     insufficient = bool(outputs.get("insufficient_data"))
@@ -218,18 +224,6 @@ def grade(
         exp in t for exp in case.expect_memories for t in memories
     ):
         failed.append("记忆:" + "|".join(case.expect_memories))
-    # 来源绑定：召回必须来自**本次运行**的前置用例（source_ref 含其 task_id）
-    if case.memory_source_case:
-        if not memory_source_task_id:
-            failed.append(f"前置用例未运行:{case.memory_source_case}")
-        else:
-            bound = [
-                m
-                for m in _retrieved_memory_refs(outcome)
-                if memory_source_task_id in m
-            ]
-            if not bound:
-                failed.append(f"记忆未绑定本次运行:{case.memory_source_case}")
 
     hit_forbidden = [w for w in case.forbid if _matches(text, w)]
     return (not failed and not hit_forbidden), failed, hit_forbidden, insufficient
@@ -325,13 +319,9 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
     )
 
     started = time.perf_counter()
-    #: case_id -> 本次运行的 task_id。记忆来源绑定需要它：
-    #: 「召回来自本次运行的前置用例」只能靠 task_id 比对（见 grade 的文档串）。
-    case_task_ids: dict[str, str] = {}
     for index, case in enumerate(cases, start=1):
         print(f"[{index}/{len(cases)}] {case.id} … ", end="", flush=True)
         event = new_task_event(case.question)
-        case_task_ids[case.id] = str(event.task_id)
         try:
             outcome = await pipeline.run(event)
         except Exception as exc:  # 单条用例失败不应中断整轮评测
@@ -355,15 +345,11 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
             print("崩溃")
             continue
 
-        passed, failed, forbidden, insufficient = grade(
-            case,
-            outcome,
-            memory_source_task_id=(
-                case_task_ids.get(case.memory_source_case)
-                if case.memory_source_case
-                else None
-            ),
-        )
+        passed, failed, forbidden, insufficient = grade(case, outcome)
+        # 记忆用例：前置用例必须**真的沉淀**（沉淀结果在它的 CaseResult 上）
+        if problem := _memory_source_problem(case, report.results):
+            failed.append(problem)
+            passed = False
         outputs = _analyst_outputs(outcome)
         docs = _retrieved_docs(outcome)
         verdict, issue_count = _review_summary(outcome)

@@ -20,7 +20,12 @@ from .base import (
     ProviderUnavailableError,
 )
 
-DEFAULT_TIMEOUT_SECONDS = 60.0
+# 单次调用（非流式）的读超时。
+# W6 实测：本地推理模型在重负载下单次调用可超过 60 秒——60 秒会把「慢但活着」的
+# 调用掐死，而 reasoning 档的主备指向同一端点，于是两次都超时、整个任务失败
+# （评测里 27 条中 1 条因此失败）。120 秒给慢调用留出完成空间；死端点的代价是
+# 等更久，属可接受（W7 的异常处理体系会补上重试与超时策略）。
+DEFAULT_TIMEOUT_SECONDS = 120.0
 
 
 class OpenAICompatibleProvider(LLMProvider):
