@@ -1,6 +1,6 @@
 # 多 Agent 接入协作项目
 
-企业级多 Agent 智能协作平台。当前处于**阶段一 MVP**（单人全职开发，计划与范围见《实施路线图》）。
+企业级多 Agent 智能协作平台。当前处于**阶段二（动态编排 + 多 Agent 协同 + 异常处理/HITL，W7 完成）**（单人全职开发，计划与范围见《实施路线图》）。
 
 ## 唯一事实源
 
@@ -63,13 +63,19 @@
    拦下），适合作为快速档/兜底，不适合承担规划与归因。两个档位的主备都指向同一个
    本地端点，因此**本地服务是可用性单点**。
 2. **无远端仓库**：回档能力目前仅限本机（见《实施路线图》风险 R12）。
-3. **时延与成功率相互牵制，W6 明码选择「保质量」**：
-   - **成功率 26/27 = 96.3%**（24 条分析 + 2 条文档 + 1 条跨会话记忆；唯一失败
-     `biggest_contributor` 是 fast 档 SQL 两次被拒、修补预算耗尽——模型质量波动，
-     见路线图 §3.11）
-   - P50 **51.2 秒**（首次进入 60 秒线），P95 80.7 秒仍未达标；reviewer 占模型调用
-     耗时 48%——这是「强制必审」的明码代价，如实记录、不追时延
-4. **推理型模型的 `max_tokens` 是「共享额度」**：推理模型会先产生思考 token 再产生
+3. **时延与成功率相互牵制，W6/W7 明码选择「保质量」**：
+   - **成功率 26/27 = 96.3%**（24 条分析 + 2 条文档 + 1 条跨会话记忆）。W7 唯一失败
+     `doc_return_policy_notice` 的原因是 Planner 把「内部通知」误标为需审批 → 任务暂停
+     （评测侧自动批准 + 提示词收敛后单跑通过），不是能力问题
+   - P50 **53.0 秒**，P95 126.5 秒仍未达标；reviewer 占模型调用耗时约 50%——
+     这是「强制必审」的明码代价，如实记录、不追时延
+4. **W7 能力的边界（如实记录）**：熔断与 HITL 均为**后端**能力——熔断后任务
+   终止于稳定错误码（`BUDGET_EXCEEDED`/`STEP_LIMIT`/`DEADLINE_EXCEEDED`），
+   单租户没有审批队列；HITL 只覆盖 `requires_human_approval` 节点的**审批门**，
+   审批 UI、条件分支/竞速、多 reviewer 仲裁、`needs_human` 的完整交互均延后。
+   动态重规划上限 1 次（`MAX_REPLANS`），复用的是「重新规划」而非旧图状态。
+   任务注册表仍是进程内：HITL 恢复可从 checkpoint 重建，但任务列表/历史事件不跨重启。
+5. **推理型模型的 `max_tokens` 是「共享额度」**：推理模型会先产生思考 token 再产生
    正文，`max_tokens` 由两者共享。额度偏小时思考会吃满全部额度，导致正文为空且
    `finish_reason=length`（W6 实测：本地 `cn:deepseek-v4.1-flash` 某次调用思考消耗
    满 8192 仍无正文，任务失败；上限已扩至 16384）。
@@ -105,6 +111,25 @@ python -m multiagent.rag.ingest --stats
 python -m multiagent.cli "分析上月华东区销售额下滑的原因"
 python -m multiagent.eval.runner --limit 3        # 全量 27 条约 45 分钟
 python -m multiagent.memory --stats               # 长期记忆维护（--search / --clear）
+```
+
+### HITL 审批（W7）
+
+高风险请求（对外发送 / 签发 / 资金或数据变更）会被 Planner 标上
+`requires_human_approval`，任务执行到该节点后**暂停**（状态 `awaiting_approval`），
+审批后从同一 checkpoint 恢复：
+
+```bash
+# 提交（命中高风险关键词会暂停）
+curl -s -X POST localhost:8000/tasks -H "Content-Type: application/json"      -d '{"question":"写一份对外公告并发送给客户"}'
+# → {"task_id":"...","status":"pending",...}
+
+# 查询：status 变为 awaiting_approval 时带了 approval_requests（节点、产物、验收标准）
+curl -s localhost:8000/tasks/<task_id>
+
+# 批准 / 驳回 / 改写（改写需提供替换后的节点产物）
+curl -s -X POST localhost:8000/tasks/<task_id>/approval      -H "Content-Type: application/json"      -d '{"decision":"approved","comment":"同意"}'
+# decision: rejected → 任务终态 rejected；rewritten → 需带 outputs
 ```
 
 > 已有数据卷的环境**不会**自动执行新增的初始化 SQL（initdb 只在空卷跑一次）。
