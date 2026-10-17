@@ -46,7 +46,7 @@
       "properties": {
         "agent_role": {
           "type": "string",
-          "enum": ["retriever", "analyst", "reviewer", "writer", "system"]
+          "enum": ["retriever", "analyst", "reviewer", "writer", "planner", "system"]
         },
         "agent_version": {
           "type": "string",

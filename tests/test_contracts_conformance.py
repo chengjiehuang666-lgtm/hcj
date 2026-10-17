@@ -191,6 +191,33 @@ def test_agent_invocation_conforms_to_schema() -> None:
     )
 
 
+def test_planner_invocation_conforms_to_schema() -> None:
+    """Planner 是图外产出者，但它确实通过 AgentInvocation 调用——
+    枚举必须含 planner。这是 W7 修正的长期契约漂移（此前每次规划都发出
+    不合冻结 Schema 的消息，而契约守卫从未以 planner 取样）。"""
+    invocation = make_invocation().model_copy(
+        update={"node_id": "planner_1", "agent_role": "planner"}
+    )
+    _assert_valid(
+        _validator("agent_io.schema.json", "/$defs/AgentInvocation"),
+        to_wire(invocation),
+        "AgentInvocation(planner)",
+    )
+
+
+def test_planner_blackboard_writer_conforms_to_schema() -> None:
+    entry = make_entry().model_copy(
+        update={
+            "written_by": WrittenBy(
+                agent_role="planner", agent_version="0.2.0", node_id="planner_1", attempt=1
+            )
+        }
+    )
+    _assert_valid(
+        _validator("blackboard_entry.schema.json"), to_wire(entry), "BlackboardEntry(planner)"
+    )
+
+
 def test_agent_result_conforms_to_schema() -> None:
     _assert_valid(
         _validator("agent_io.schema.json", "/$defs/AgentResult"),

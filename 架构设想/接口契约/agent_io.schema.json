@@ -32,7 +32,7 @@
         },
         "agent_role": {
           "type": "string",
-          "enum": ["retriever", "analyst", "reviewer", "writer"],
+          "enum": ["retriever", "analyst", "reviewer", "writer", "planner"],
           "description": "目标 Agent 角色。Orchestrator 据此路由到对应实现。"
         },
         "trace_id": {
