@@ -142,6 +142,9 @@ class Settings(BaseSettings):
     default_max_tokens: int = 60_000
     default_max_retries: int = 2
     default_task_timeout_seconds: int = 300
+    #: 动态重规划次数上限（W7）。触发条件=节点重试耗尽或 Agent 返回 needs_replan；
+    #: 超出后任务以最后一次失败终止。1 次是「先量后改」下的保守起点。
+    max_replans: int = 1
 
     # 单次模型调用的输出上限（reasoning 档）。
     # max_tokens 只是上限、不用不收费，所以给足以免被截断。

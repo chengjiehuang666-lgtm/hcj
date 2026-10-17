@@ -779,3 +779,58 @@ def test_invocation_budget_derives_from_task_budget() -> None:
         budget={"max_tokens": 500, "deadline": "2026-01-01T00:00:00+08:00"},
     )
     assert inv3.budget.max_tokens == 500
+
+
+# ------------------------------------------------ W7：高风险请求的审批门禁
+
+
+def _risky_plan(*, with_approval: bool) -> str:
+    writer = _node_payload("writer_1", "writer", ["retriever_1"])
+    if with_approval:
+        writer["requires_human_approval"] = True
+    return _plan(
+        [
+            _node_payload("retriever_1", "retriever", [], mode="knowledge"),
+            writer,
+        ]
+    )
+
+
+def test_planner_requires_approval_node_for_risky_request() -> None:
+    """高风险请求必须产出审批节点——代码门禁，不只靠提示词。"""
+    import asyncio
+
+    gateway = FakeGateway(_risky_plan(with_approval=False))
+    inv = _invocation(
+        question="写一份对外公告并发送给客户",
+        available_roles=["retriever", "writer"],
+    )
+    result = asyncio.run(PlannerAgent().invoke(inv, _ctx(gateway)))
+    assert result.status is ResultStatus.failed
+    assert result.error.code == "UNSUPPORTED_PLAN"
+    assert "requires_human_approval" in result.error.message
+
+
+def test_planner_accepts_risky_request_with_approval_node() -> None:
+    import asyncio
+
+    gateway = FakeGateway(_risky_plan(with_approval=True))
+    inv = _invocation(
+        question="写一份对外公告并发送给客户",
+        available_roles=["retriever", "writer"],
+    )
+    result = asyncio.run(PlannerAgent().invoke(inv, _ctx(gateway)))
+    assert result.status is ResultStatus.ok, result.error
+    writer = next(
+        n for n in result.outputs["dag"]["nodes"] if n["node_id"] == "writer_1"
+    )
+    assert writer["requires_human_approval"] is True
+
+
+def test_planner_plain_request_needs_no_approval() -> None:
+    """普通分析请求不因门禁要求审批节点（既有链路零变化）。"""
+    import asyncio
+
+    gateway = FakeGateway(_plan_with_retrievers("metrics", "knowledge"))
+    result = asyncio.run(PlannerAgent().invoke(_invocation(), _ctx(gateway)))
+    assert result.status is ResultStatus.ok, result.error

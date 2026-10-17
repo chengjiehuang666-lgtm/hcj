@@ -321,7 +321,7 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
     started = time.perf_counter()
     for index, case in enumerate(cases, start=1):
         print(f"[{index}/{len(cases)}] {case.id} … ", end="", flush=True)
-        event = new_task_event(case.question)
+        event = new_task_event(case.question, settings=settings)
         try:
             outcome = await pipeline.run(event)
         except Exception as exc:  # 单条用例失败不应中断整轮评测

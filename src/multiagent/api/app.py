@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from typing import Any, Awaitable, Callable
+from typing import Any, Literal, Awaitable, Callable
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 from ..config import Settings
 from ..graph import AnalysisPipeline
 from ..graph.pipeline import PipelineOutcome, new_task_event
-from .tasks import TaskRecord, TaskRegistry, _now_iso
+from .tasks import TERMINAL_STATUSES, TaskRecord, TaskRegistry, _now_iso
 
 #: 流水线工厂签名：(settings, on_event) -> 具备 run(task_event) 的对象。
 #: 抽出来是为了让测试注入假流水线，不必真的调模型。
@@ -45,6 +45,16 @@ class SubmitResponse(BaseModel):
     status: str
     poll_url: str
     events_url: str
+
+
+class ApprovalBody(BaseModel):
+    """HITL 审批决策（POST /tasks/{id}/approval 的请求体）。"""
+
+    decision: Literal["approved", "rejected", "rewritten"]
+    comment: str = ""
+    #: decision=rewritten 时必填：替换后的节点产物
+    outputs: dict[str, Any] | None = None
+    approver: str = "local_dev"
 
 
 def _default_pipeline_factory(settings: Settings, on_event) -> AnalysisPipeline:
@@ -66,6 +76,14 @@ def _outcome_to_result(outcome: PipelineOutcome) -> dict[str, Any]:
         "total_tokens": outcome.total_tokens,
         "duration_ms": outcome.duration_ms,
         "tokens_by_route": outcome.tokens_by_route,
+        # 失败/驳回的稳定错误码与可重试性（熔断：BUDGET_EXCEEDED/STEP_LIMIT/...）
+        "error": outcome.error,
+        "error_code": outcome.error_code,
+        # DAG 版本（1 = 首版；重规划后递增）
+        "revision": outcome.revision,
+        # HITL：等待审批时的请求明细（节点、产物、验收标准）
+        "approval_requests": outcome.approval_requests,
+        "approvals": outcome.approvals,
         # 本次任务沉淀进长期记忆的条目 id（未沉淀为 None；沉淀失败只影响该字段）
         "memory_sunk": outcome.memory_sunk,
         "nodes": [
@@ -156,31 +174,52 @@ def create_app(
         description="REST 提交分析任务 + SSE 订阅执行进度。",
     )
 
-    async def _execute(record: TaskRecord) -> None:
+    async def _execute(record: TaskRecord, *, resume_value: dict[str, Any] | None = None) -> None:
         async def on_event(name: str, payload: dict[str, Any]) -> None:
             record.publish(name, **payload)
             registry.trim(record)
 
         try:
             record.status = "running"
-            record.publish("task_started", question=record.question)
+            record.error = None
+            record.publish(
+                "task_resumed" if resume_value is not None else "task_started",
+                question=record.question,
+            )
             pipeline = factory(app_settings, on_event)
-            outcome = await pipeline.run(new_task_event(record.question))
+            outcome = await pipeline.run(
+                record.task_event,
+                resume=resume_value is not None,
+                resume_value=resume_value,
+            )
+            if outcome.status == "awaiting_approval":
+                # HITL 暂停：非终态。不发 task_finished，SSE 流保持打开等审批。
+                record.status = "awaiting_approval"
+                record.approval_requests = outcome.approval_requests
+                record.result = _outcome_to_result(outcome)
+                record.publish(
+                    "approval_required",
+                    requests=outcome.approval_requests,
+                )
+                return
             record.result = _outcome_to_result(outcome)
-            record.status = "ok" if outcome.status == "ok" else "failed"
+            # ok / rejected 原样传递；failed 也保持 failed
+            record.status = outcome.status
+            record.approval_requests = []
             if outcome.status != "ok":
                 record.error = outcome.error
         except Exception as exc:  # 兜底：任务异常不得让服务崩掉
             record.status = "failed"
             record.error = f"{type(exc).__name__}: {exc}"[:500]
         finally:
-            record.finished_at = _now_iso()
-            record.publish(
-                "task_finished",
-                status=record.status,
-                error=record.error,
-                summary=(record.result or {}).get("summary", ""),
-            )
+            if record.status in TERMINAL_STATUSES:
+                record.finished_at = _now_iso()
+                record.publish(
+                    "task_finished",
+                    status=record.status,
+                    error=record.error,
+                    summary=(record.result or {}).get("summary", ""),
+                )
 
     # ------------------------------------------------------------------ 路由
 
@@ -198,6 +237,11 @@ def create_app(
     async def submit(request: SubmitRequest) -> SubmitResponse:
         task_id = str(uuid.uuid4())
         record = registry.create(task_id, request.question)
+        # TaskEvent 只创建一次：task_id 同时是 checkpointer 的 thread_id，
+        # HITL 恢复/续跑必须能找回来（此前每次 run 都新生成 UUID，恢复无从下手）。
+        record.task_event = new_task_event(
+            request.question, settings=app_settings, task_id=task_id
+        )
         # 后台执行，不阻塞提交响应——这是 SSE 能实时推送的前提
         asyncio.create_task(_execute(record))
         return SubmitResponse(
@@ -206,6 +250,55 @@ def create_app(
             poll_url=f"/tasks/{task_id}",
             events_url=f"/tasks/{task_id}/events",
         )
+
+    async def _recover_record(task_id: str) -> TaskRecord | None:
+        """进程重启后从 checkpoint 重建任务记录（thread_id == API task_id）。"""
+        pipeline = factory(app_settings, None)
+        try:
+            event = await pipeline.load_saved_task(task_id)
+        except Exception:  # noqa: BLE001 — 恢复失败按 404 处理
+            return None
+        if event is None:
+            return None
+        record = registry.create(task_id, event.payload.text)
+        record.task_event = event
+        # 能走到恢复流程的前提是任务停在审批门；无权停留的任务会在 resume 时自然收尾
+        record.status = "awaiting_approval"
+        record.publish("task_recovered", task_id=task_id)
+        return record
+
+    @app.post("/tasks/{task_id}/approval", status_code=202)
+    async def submit_approval(task_id: str, body: ApprovalBody) -> dict[str, Any]:
+        """HITL 后端阻塞点：批准 / 驳回 / 改写，然后从暂停处恢复执行。"""
+        record = registry.get(task_id)
+        if record is None:
+            record = await _recover_record(task_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404, detail=f"任务不存在或无法从 checkpoint 恢复: {task_id}"
+            )
+        if record.status != "awaiting_approval":
+            raise HTTPException(
+                status_code=409, detail=f"任务当前状态不可审批: {record.status}"
+            )
+        if body.decision == "rewritten" and not body.outputs:
+            raise HTTPException(
+                status_code=422, detail="rewritten 决策必须提供 outputs（替换后的节点产物）"
+            )
+        record.status = "running"
+        record.publish(
+            "approval_received",
+            decision=body.decision,
+            comment=body.comment,
+            approver=body.approver,
+        )
+        resume_value = {
+            "decision": body.decision,
+            "comment": body.comment,
+            "outputs": body.outputs,
+        }
+        asyncio.create_task(_execute(record, resume_value=resume_value))
+        return {"task_id": task_id, "status": "running"}
 
     @app.get("/tasks")
     async def list_tasks(limit: int = 20) -> dict[str, Any]:

@@ -29,12 +29,14 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
+from pydantic import BaseModel, Field
 
 from ..agents import AgentContext, BaseAgent, build_agent_registry
-from ..config import Settings
+from ..config import Settings, get_settings
 from ..memory import MemoryStore
 from ..contracts import (
     AgentInvocation,
@@ -73,10 +75,15 @@ def _concat_lists(left: list | None, right: list | None) -> list:
     return [*(left or []), *(right or [])]
 
 
+def _add_int(left: int | None, right: int | None) -> int:
+    """整数累加。用于步骤/Token 计数——并行节点各写各的增量，由 reducer 汇总。"""
+    return (left or 0) + (right or 0)
+
+
 class PipelineState(TypedDict, total=False):
     """图状态。字段尽量保持可 JSON 序列化，以便 Checkpoint 落库。
 
-    ⚠️ 三个带 reducer 的字段是**并行安全的必要条件**，不要去掉 reducer
+    ⚠️ 带 reducer 的字段是**并行安全的必要条件**，不要去掉 reducer
     （原因见模块 docstring）。
     """
 
@@ -92,6 +99,30 @@ class PipelineState(TypedDict, total=False):
     blackboard: Annotated[dict[str, Any], _merge_dicts]
     #: 逐节点结果（按完成顺序追加，只增不改）
     node_results: Annotated[list[dict[str, Any]], _concat_lists]
+
+    # ---- 任务级预算计数：并行节点各写增量，必须带 reducer ----
+    #: 已执行步数（节点执行次数，含重试的 attempt；Planner 图外调用计 1 步）
+    steps_used: Annotated[int, _add_int]
+    #: 已消耗 token（按节点结果累计；失败 attempt 也计入）
+    tokens_used: Annotated[int, _add_int]
+
+    # ---- 人工审批（HITL）----
+    #: node_id -> 审批决策（approved / rejected / rewritten）
+    approvals: Annotated[dict[str, dict[str, Any]], _merge_dicts]
+    #: 本图的 DAG 指纹：恢复前比对，拓扑变了就明确拒绝（否则暂停状态会静默失效）
+    dag_hash: str
+
+
+#: 审批门节点名的后缀：`{node_id}__approval`
+APPROVAL_SUFFIX = "__approval__"
+
+
+class ApprovalDecision(BaseModel):
+    """人工审批决策（HITL）。rewrite 时 outputs 为替换后的节点产物。"""
+
+    decision: Literal["approved", "rejected", "rewritten"]
+    comment: str = ""
+    outputs: dict[str, Any] | None = None
 
 
 class PipelineNodeFailed(Exception):
@@ -128,6 +159,16 @@ class PipelineOutcome:
     #: 本次任务沉淀进长期记忆的条目 id（未沉淀为 None）；沉淀失败时 error 记录原因
     memory_sunk: int | None = None
     memory_error: str | None = None
+    #: 人工审批请求（status="awaiting_approval" 时给出：节点、产物、验收标准）
+    approval_requests: list[dict[str, Any]] = field(default_factory=list)
+    #: 人工审批决策记录：node_id -> 决策（approved / rejected / rewritten）
+    approvals: dict[str, Any] = field(default_factory=dict)
+    #: 稳定错误码（failed 时给出：BUDGET_EXCEEDED / STEP_LIMIT / DEADLINE_EXCEEDED 等）
+    error_code: str | None = None
+    #: 该失败是否可重试（契约语义，供上层决定重试/续跑）
+    retryable: bool | None = None
+    #: 本次执行使用的 DAG 版本（1 = 首版；重规划后递增）
+    revision: int = 1
 
     def outputs_for_role(self, role: str) -> list[dict[str, Any]]:
         """按 agent_role 取该角色所有节点的 outputs（按发生顺序，结果稳定）。
@@ -447,6 +488,16 @@ class AnalysisPipeline:
         黑板条目按**冻结契约** `BlackboardEntry` 构造，不再手写近似 dict——
         条目是「结论可回溯」的落点，形状漂移会让契约校验形同虚设。
         """
+        # needs_replan / needs_human 是契约里的**独立语义**，不是 failed：
+        # 前者交给 run() 的有界重规划，后者是「转人工」的落点（终止于稳定错误码）。
+        if result.status is ResultStatus.needs_replan:
+            raise PipelineNodeFailed(
+                inv.node_id, "NEEDS_REPLAN", "Agent 判定当前拆解不可行，需重规划", False
+            )
+        if result.status is ResultStatus.needs_human:
+            raise PipelineNodeFailed(
+                inv.node_id, "NEEDS_HUMAN", "Agent 请求转人工", False
+            )
         if result.status is not ResultStatus.ok:
             err = result.error
             raise PipelineNodeFailed(
@@ -491,6 +542,59 @@ class AnalysisPipeline:
             "node_results": [wire],
         }
 
+    @staticmethod
+    def _budget_limits(state: PipelineState) -> dict[str, Any]:
+        """取任务预算（state 里是序列化 dict）；缺项回退契约默认值。"""
+        raw = (state.get("task_event") or {}).get("budget") or {}
+        return {
+            "max_steps": int(raw.get("max_steps") or 30),
+            "max_tokens": int(raw.get("max_tokens") or 200_000),
+            "max_retries": int(raw.get("max_retries") or 0),
+            "deadline": raw.get("deadline"),
+        }
+
+    @staticmethod
+    def _budget_breach(node_id: str, state: PipelineState) -> tuple[str, str] | None:
+        """执行**前**检查四大约束；超限返回 (code, message)，否则 None。
+
+        为什么不挪到节点完成后检查：LangGraph 的兄弟节点在同一 superstep 里
+        并发起跑，事后检查只能拦住「下一个」节点；事前检查能让超限后**不再启动
+        新节点**。代价是单节点的开销可能使总量略微越界，这是可接受的边界。
+
+        「转人工」的落点：任务以稳定错误码终止 + `task_breaker_tripped` 事件
+        （单租户无审批队列；人工通过 GET /tasks 查看原因）。
+        """
+        limits = AnalysisPipeline._budget_limits(state)
+        steps = int(state.get("steps_used") or 0)
+        tokens = int(state.get("tokens_used") or 0)
+        if steps >= limits["max_steps"]:
+            return (
+                "STEP_LIMIT",
+                f"节点 {node_id} 启动前已执行 {steps} 步，达到 max_steps={limits['max_steps']}",
+            )
+        if tokens >= limits["max_tokens"]:
+            return (
+                "BUDGET_EXCEEDED",
+                f"节点 {node_id} 启动前已消耗 {tokens} token，达到 max_tokens={limits['max_tokens']}",
+            )
+        deadline_raw = limits["deadline"]
+        if deadline_raw:
+            try:
+                deadline = datetime.fromisoformat(str(deadline_raw))
+            except ValueError:
+                deadline = None
+            if deadline is not None:
+                try:
+                    remaining = (deadline - datetime.now(TZ_CN)).total_seconds()
+                except TypeError:  # 无时区的 deadline：不猜
+                    remaining = None
+                if remaining is not None and remaining <= 0:
+                    return (
+                        "DEADLINE_EXCEEDED",
+                        f"节点 {node_id} 启动前任务已过截止时间 {deadline_raw}",
+                    )
+        return None
+
     def _make_node_fn(self, ctx: AgentContext, node: SubtaskNode):
         """为一个 DAG 节点生成 LangGraph 节点函数。"""
 
@@ -501,23 +605,112 @@ class AnalysisPipeline:
                     f"节点 {node.node_id} 的角色 {node.agent_role.value!r} 未注册"
                 )
             task_id = state["task_event"]["task_id"]
+            # 人工驳回：上游被驳回后，下游节点在执行前短路（Agent 不会运行）。
+            # 用异常而非 Command(goto)：后者不会压制静态边，下游照样会跑（实测）。
+            rejected_upstream = [
+                nid
+                for nid, d in (state.get("approvals") or {}).items()
+                if d.get("decision") == "rejected"
+            ]
+            if rejected_upstream:
+                raise PipelineNodeFailed(
+                    node.node_id,
+                    "APPROVAL_REJECTED",
+                    f"上游节点 {rejected_upstream} 被人工驳回，任务终止",
+                    False,
+                )
+            # 四大约束：超限的节点**不启动**（熔断 + 事件）
+            if breach := self._budget_breach(node.node_id, state):
+                code, message = breach
+                limits = self._budget_limits(state)
+                await self._emit(
+                    "task_breaker_tripped",
+                    node_id=node.node_id,
+                    code=code,
+                    message=message,
+                    steps_used=int(state.get("steps_used") or 0),
+                    tokens_used=int(state.get("tokens_used") or 0),
+                    max_steps=limits["max_steps"],
+                    max_tokens=limits["max_tokens"],
+                )
+                raise PipelineNodeFailed(node.node_id, code, message, False)
             await self._emit(
                 "node_started", node_id=node.node_id, agent_role=node.agent_role.value
             )
             inputs = self._build_node_input(node, state)
-            inv = self._make_invocation(
-                node.node_id,
-                node.agent_role.value,
-                inputs,
-                task_id=task_id,
-                # 契约字段落到实处：本节点能读到的黑板条目 = 直接上游写入的那些
-                visible_blackboard_keys=sorted(inputs.get("blackboard") or {}),
-                budget=(state.get("task_event") or {}).get("budget"),
+            limits = self._budget_limits(state)
+            # 尝试次数 = 1 + min(节点 max_retries, 任务 max_retries)。
+            # 两层重试各归各的：Agent 内部的 call_json 纠错不算在这里，这里只重试
+            # **节点级**的可重试失败（契约 error.retryable）。
+            max_attempts = 1 + max(0, min(int(node.max_retries), limits["max_retries"]))
+            timeout = min(
+                self.settings.default_task_timeout_seconds, int(node.timeout_seconds)
             )
-            result = await agent.invoke(inv, ctx)
-            delta = self._absorb(
-                inv, result, agent, blackboard=state.get("blackboard") or {}
-            )
+            last_error: PipelineNodeFailed | None = None
+            delta: dict[str, Any] | None = None
+            result = None
+            attempt = 1
+            while attempt <= max_attempts:
+                inv = self._make_invocation(
+                    node.node_id,
+                    node.agent_role.value,
+                    inputs,
+                    task_id=task_id,
+                    attempt=attempt,
+                    # 契约字段落到实处：本节点能读到的黑板条目 = 直接上游写入的那些
+                    visible_blackboard_keys=sorted(inputs.get("blackboard") or {}),
+                    budget=(state.get("task_event") or {}).get("budget"),
+                )
+                try:
+                    result = await asyncio.wait_for(
+                        agent.invoke(inv, ctx), timeout=float(timeout)
+                    )
+                except asyncio.TimeoutError:
+                    last_error = PipelineNodeFailed(
+                        node.node_id,
+                        "TIMEOUT",
+                        f"第 {attempt} 次执行超时（上限 {timeout}s）",
+                        True,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 — 未预料异常按可重试处理
+                    last_error = PipelineNodeFailed(
+                        node.node_id,
+                        "INTERNAL_ERROR",
+                        f"{type(exc).__name__}: {exc}"[:300],
+                        True,
+                    )
+                if result is not None:
+                    try:
+                        delta = self._absorb(
+                            inv, result, agent, blackboard=state.get("blackboard") or {}
+                        )
+                    except PipelineNodeFailed as exc:
+                        last_error = exc
+                        if not exc.retryable:
+                            raise
+                    else:
+                        break  # 成功
+                await self._emit(
+                    "node_retry",
+                    node_id=node.node_id,
+                    agent_role=node.agent_role.value,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    code=last_error.code if last_error else "UNKNOWN",
+                    message=(last_error.message if last_error else "")[:200],
+                )
+                result = None
+                attempt += 1
+            if delta is None:
+                assert last_error is not None
+                raise last_error
+            # 预算计数：步数与 token 都计入（并行节点各写增量，由 reducer 汇总）。
+            # 注意：失败的 attempt 其 token 体现在 call_records（成本归因），
+            # 不计入本 delta——节点抛错时 LangGraph 不落它的写。
+            delta["steps_used"] = 1
+            delta["tokens_used"] = result.tokens_used.total
             for key, entry in delta.get("blackboard", {}).items():
                 # 黑板变更通知走进程内事件通道（= SSE）；跨进程订阅属多进程阶段
                 await self._emit(
@@ -542,8 +735,74 @@ class AnalysisPipeline:
 
         return run_node
 
+    def _make_approval_gate(self, node: SubtaskNode):
+        """为一个要求人工审批的节点生成审批门（HITL 后端阻塞点）。
+
+        **门是独立节点、位于被审节点之后**：LangGraph 恢复时会把中断所在节点从头
+        重放，若在 Agent 节点内 pause，模型调用与黑板写入都会重复执行。门内只有
+        interrupt 与纯状态整理，重放无副作用；审批发生在被审节点完成之后的新
+        superstep，下游因此不会提前起跑。
+        """
+
+        async def gate(state: PipelineState) -> dict:
+            outputs = (state.get("node_outputs") or {}).get(node.node_id) or {}
+            keys = sorted(
+                key
+                for key in (state.get("blackboard") or {})
+                if key.split(".", 1)[0] == node.node_id
+            )
+            decision = interrupt(
+                {
+                    "kind": "node_approval",
+                    "task_id": state["task_event"]["task_id"],
+                    "node_id": node.node_id,
+                    "agent_role": node.agent_role.value,
+                    "acceptance": list(node.acceptance),
+                    "outputs": outputs,
+                    "blackboard_keys": keys,
+                },
+                response_schema=ApprovalDecision,
+            )
+            result: dict[str, Any] = {
+                "approvals": {node.node_id: decision.model_dump()},
+            }
+            if decision.decision == "rewritten":
+                replacement = dict(decision.outputs or {})
+                result["node_outputs"] = {node.node_id: replacement}
+                # 人工改写以版本 +1 写入黑板：状态直接 validated（人已确认），
+                # 写入者记 system（契约枚举无 human；审批人记在 source ref 里）
+                updated: dict[str, Any] = {}
+                for key in keys:
+                    entry = BlackboardEntry.model_validate(state["blackboard"][key])
+                    updated[key] = to_wire(
+                        entry.next_version(
+                            replacement,
+                            status=EntryStatus.validated,
+                            written_by=WrittenBy(
+                                agent_role="system",
+                                agent_version="human-approval",
+                                node_id=node.node_id,
+                                attempt=1,
+                            ),
+                            written_at=datetime.now(TZ_CN),
+                        )
+                    )
+                result["blackboard"] = updated
+            return result
+
+        return gate
+
+    @staticmethod
+    def _dag_hash(dag_json: dict[str, Any]) -> str:
+        """DAG 指纹：恢复前比对。拓扑变了而恢复，暂停状态会**静默失效**。"""
+        import hashlib
+        import json as _json
+
+        payload = _json.dumps(dag_json, ensure_ascii=False, sort_keys=True)
+        return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
     def _build_from_dag(self, ctx: AgentContext, dag: SubtaskDAG):
-        """按 DAG 构图：节点 = DAG 节点，边 = depends_on。
+        """按 DAG 构图：节点 = DAG 节点，边 = depends_on；审批节点后插审批门。
 
         同一层互不依赖的节点没有互相的入边，LangGraph 会在同一个 superstep 内
         并发执行它们——这正是动态 DAG 引擎要的东西。
@@ -560,21 +819,52 @@ class AnalysisPipeline:
         builder = StateGraph(PipelineState)
         for node in dag.nodes:
             builder.add_node(node.node_id, self._make_node_fn(ctx, node))
+
+        # 审批门：requires_human_approval=true 的节点之后
+        gates = {
+            n.node_id: f"{n.node_id}{APPROVAL_SUFFIX}"
+            for n in dag.nodes
+            if n.requires_human_approval
+        }
+        for node in dag.nodes:
+            if node.node_id in gates:
+                builder.add_node(gates[node.node_id], self._make_approval_gate(node))
+                builder.add_edge(node.node_id, gates[node.node_id])
+
+        dependents: dict[str, list[str]] = {}
+        for node in dag.nodes:
+            for dep in node.depends_on:
+                dependents.setdefault(dep, []).append(node.node_id)
+
         for node in dag.nodes:
             if node.depends_on:
                 # 必须用**列表形式**连边（join 语义）。逐个 add_edge(dep, node) 是
                 # 「任一上游完成即触发」：依赖跨层时下游会提前执行一次、依赖齐了再跑一次。
                 # 这是 W6 被黑板冲突检测抓到的 W5 引擎缺陷（菱形用例的两路恰好同一步完成，
                 # 掩盖了它；只有依赖横跨两层时才现形）。
-                builder.add_edge(list(node.depends_on), node.node_id)
+                # 依赖了被审节点时，边改接到审批门（等人工批准后才放行）。
+                builder.add_edge(
+                    [gates.get(dep, dep) for dep in node.depends_on], node.node_id
+                )
             else:
                 builder.add_edge(START, node.node_id)
+
+        # 驳回的两种收尾：被审汇点由 run() 读 approvals 判 rejected；有下游时，
+        # 下游节点在执行前看到驳回记录即短路（见 _make_node_fn 顶部），
+        # 不依赖 Command(goto) ——实测它不会压制静态边，下游照样会跑。
+        gated_sinks = set(gates)
         for sink in sink_node_ids(dag.model_dump(mode="json")):
-            builder.add_edge(sink, END)
+            builder.add_edge(gates.get(sink, sink) if sink in gated_sinks else sink, END)
         return builder
 
     # -------------------------------------------------------------------- 执行
-    async def run(self, event: TaskEvent, *, resume: bool = False) -> PipelineOutcome:
+    async def run(
+        self,
+        event: TaskEvent,
+        *,
+        resume: bool = False,
+        resume_value: Any = None,
+    ) -> PipelineOutcome:
         from psycopg.rows import dict_row
         from psycopg_pool import AsyncConnectionPool
 
@@ -591,6 +881,13 @@ class AnalysisPipeline:
             sandbox=SqlSandbox(self.settings),
             registry=registry,
         )
+        #: 重规划轮次（1 = 首版）。每轮用独立 thread：新 DAG 从头执行，
+        #: 不复用旧图状态（复用需要改写 checkpoint，明确不做）。
+        revision = 1
+        max_replans = max(0, int(self.settings.max_replans))
+        carried: dict[str, Any] = {}
+        previous_dag: SubtaskDAG | None = None
+        last_failure: PipelineNodeFailed | None = None
         config = {"configurable": {"thread_id": task_id}}
 
         pool = AsyncConnectionPool(
@@ -604,50 +901,128 @@ class AnalysisPipeline:
             saver = AsyncPostgresSaver(pool)
             await saver.setup()
 
-            # ---- Planner 先跑（图外的产出者）+ 构图 ----
-            if resume:
-                # 续跑时图结构必须与首次一致，否则与 checkpoint 的语义未定义。
-                # 因此从 checkpoint 里取回原 DAG，而不是重新规划。
-                snapshot = await saver.aget(config)
-                if snapshot is None:
-                    raise PipelineNodeFailed(
-                        PLANNER_NODE_ID, "NO_CHECKPOINT", f"线程 {task_id} 无 checkpoint，无法续跑", False
-                    )
-                dag = SubtaskDAG.model_validate(
-                    snapshot.checkpoint["channel_values"]["dag"]
-                )
-                initial: PipelineState | None = None  # None = 由 checkpoint 恢复状态
-            else:
-                dag, initial = await self._plan(ctx, event, task_id)
+            while True:
+                thread_id = task_id if revision == 1 else f"{task_id}:r{revision}"
+                config = {"configurable": {"thread_id": thread_id}}
 
-            graph = self._build_from_dag(ctx, dag).compile(checkpointer=saver)
-            final = await graph.ainvoke(initial, config=config)
+                # ---- Planner 先跑（图外的产出者）+ 构图 ----
+                if resume and revision == 1:
+                    # 续跑时图结构必须与首次一致，否则与 checkpoint 的语义未定义。
+                    # 因此从 checkpoint 里取回原 DAG，而不是重新规划。
+                    snapshot = await saver.aget(config)
+                    if snapshot is None:
+                        raise PipelineNodeFailed(
+                            PLANNER_NODE_ID, "NO_CHECKPOINT", f"线程 {task_id} 无 checkpoint，无法续跑", False
+                        )
+                    saved = (
+                        snapshot.get("channel_values") or {}
+                        if isinstance(snapshot, dict)
+                        else (getattr(snapshot, "checkpoint", None) or {}).get("channel_values") or {}
+                    )
+                    dag = SubtaskDAG.model_validate(saved["dag"])
+                    # 拓扑守卫：节点/边变了而恢复，LangGraph 会**静默丢弃**暂停状态
+                    stored_hash = saved.get("dag_hash")
+                    if stored_hash and stored_hash != self._dag_hash(saved["dag"]):
+                        raise PipelineNodeFailed(
+                            PLANNER_NODE_ID,
+                            "DAG_MISMATCH",
+                            "恢复时的 DAG 指纹与 checkpoint 不一致（拓扑已被修改）",
+                            False,
+                        )
+                    # 动态中断（HITL）只能用 Command(resume=...) 恢复；
+                    # 传 None 是给静态断点用的，会重放节点并再次暂停。
+                    initial = (
+                        Command(resume=resume_value) if resume_value is not None else None  # type: ignore[assignment]
+                    )
+                else:
+                    dag, initial = await self._plan(
+                        ctx,
+                        event,
+                        task_id,
+                        previous=previous_dag,
+                        failure=last_failure,
+                        revision=revision,
+                    )
+                    # 预算是**任务级**的：重规划承接前一轮已消耗的步数/token
+                    initial["steps_used"] = int(carried.get("steps_used") or 0) + int(
+                        initial.get("steps_used") or 0
+                    )
+                    initial["tokens_used"] = int(carried.get("tokens_used") or 0) + int(
+                        initial.get("tokens_used") or 0
+                    )
+
+                try:
+                    graph = self._build_from_dag(ctx, dag).compile(checkpointer=saver)
+                    final = await graph.ainvoke(initial, config=config)
+                    break
+                except PipelineNodeFailed as exc:
+                    state = await self._read_checkpoint_state(saver, config)
+                    # 触发重规划的两条路径：Agent 显式 needs_replan；或可重试失败
+                    # 已耗尽节点重试。其余错误（含 NEEDS_HUMAN）直接终止。
+                    if exc.code == "NEEDS_HUMAN":
+                        raise
+                    if revision <= max_replans and (
+                        exc.code == "NEEDS_REPLAN" or exc.retryable
+                    ):
+                        await self._emit(
+                            "replan_triggered",
+                            task_id=task_id,
+                            revision=revision + 1,
+                            failure_code=exc.code,
+                            node_id=exc.node_id,
+                            message=exc.message[:200],
+                        )
+                        previous_dag = dag
+                        last_failure = exc
+                        carried = {
+                            "steps_used": int(state.get("steps_used") or 0),
+                            "tokens_used": int(state.get("tokens_used") or 0),
+                        }
+                        revision += 1
+                        continue
+                    raise
         except PipelineNodeFailed as exc:
-            return PipelineOutcome(
-                task_id=task_id,
-                status="failed",
-                # 带上节点名：只报错误码会让「哪个节点挂的」无从判断
-                error=f"[{exc.code}] 节点 {exc.node_id}: {exc.message}",
-                duration_ms=int((time.perf_counter() - started) * 1000),
-                call_records=_serialize_call_records(router),
+            # 失败路径保真：从 checkpoint 取回已完成节点的结果与累计 token。
+            # W6 的观测缺口：失败时 outcome 只带错误串、token 显示 0、已完成节点全丢
+            # ——而失败/重试恰恰最耗 token，熔断计数与成本归因都依赖它。
+            state = await self._read_checkpoint_state(saver, config)
+            return self._failed_outcome(
+                task_id, exc, state, router, started, revision=revision
             )
         except PipelinePlanError as exc:
-            return PipelineOutcome(
-                task_id=task_id,
-                status="failed",
-                error=f"[PLAN_INVALID] {exc}",
-                duration_ms=int((time.perf_counter() - started) * 1000),
-                call_records=_serialize_call_records(router),
+            state = await self._read_checkpoint_state(saver, config)
+            return self._failed_outcome(
+                task_id,
+                PipelineNodeFailed(PLANNER_NODE_ID, "PLAN_INVALID", str(exc), False),
+                state,
+                router,
+                started,
+                revision=revision,
             )
         finally:
             await pool.close()
 
+        # HITL：运行被 interrupt 暂停时，ainvoke 正常返回并带 __interrupt__
+        if isinstance(final, dict) and final.get("__interrupt__"):
+            requests = [
+                {"id": item.id, "value": item.value}
+                for item in final["__interrupt__"]
+            ]
+            state = {k: v for k, v in final.items() if k != "__interrupt__"}
+            return self._awaiting_outcome(
+                task_id, state, requests, router, started, revision=revision
+            )
+
         duration_ms = int((time.perf_counter() - started) * 1000)
         node_results = final.get("node_results", [])
         node_outputs = final.get("node_outputs", {})
+        approvals = final.get("approvals") or {}
+        rejected = sorted(
+            nid for nid, d in approvals.items() if d.get("decision") == "rejected"
+        )
         outcome = PipelineOutcome(
             task_id=task_id,
-            status="ok",
+            status="rejected" if rejected else "ok",
             blackboard=final.get("blackboard", {}),
             node_results=node_results,
             node_outputs=node_outputs,
@@ -656,6 +1031,11 @@ class AnalysisPipeline:
             total_tokens=sum(r.get("tokens_used", {}).get("total", 0) for r in node_results),
             duration_ms=duration_ms,
             call_records=_serialize_call_records(router),
+            approvals=approvals,
+            error=(
+                f"人工驳回：{', '.join(rejected)}" if rejected else None
+            ),
+            revision=revision,
         )
         if unmapped := getattr(router, "unmapped_routes", None):
             # 路由表漏配不是致命错误（会退回默认档），但必须能被发现
@@ -665,6 +1045,131 @@ class AnalysisPipeline:
         if self.settings.memory_sink_enabled and outcome.status == "ok":
             await self._sink_memory(outcome)
         return outcome
+
+    @staticmethod
+    async def _read_checkpoint_state(saver, config) -> dict[str, Any]:
+        """失败路径：从 checkpoint 取回已完成节点的状态（best-effort）。
+
+        取不到（例如 Planner 阶段就失败、尚无 checkpoint）时返回空 dict，
+        失败结果退化为「只带错误信息」——不因为读 checkpoint 失败而吞掉原始错误。
+        """
+        try:
+            snapshot = await saver.aget(config)
+        except Exception:  # noqa: BLE001 — 观测增强不得掩盖原始失败
+            return {}
+        if snapshot is None:
+            return {}
+        # langgraph-checkpoint 4.3 的 `aget` 返回 checkpoint **dict 本身**；
+        # CheckpointTuple（带 .checkpoint）是 `aget_tuple` 的形态。两种都兼容，
+        # 免得再踩「按文档假设形状」的坑（W5 的 resume 分支正是因此从未走通）。
+        if isinstance(snapshot, dict):
+            return snapshot.get("channel_values") or {}
+        return (getattr(snapshot, "checkpoint", None) or {}).get("channel_values") or {}
+
+    def _failed_outcome(
+        self,
+        task_id: str,
+        exc: PipelineNodeFailed,
+        state: dict[str, Any],
+        router,
+        started: float,
+        *,
+        revision: int = 1,
+    ) -> PipelineOutcome:
+        """构造失败结果，并尽量带上已完成节点的部分结果与 token。"""
+        node_results = list(state.get("node_results") or [])
+        node_outputs = dict(state.get("node_outputs") or {})
+        dag = state.get("dag") or {}
+        try:
+            summary = _sink_summary(dag, node_outputs) if dag else ""
+        except Exception:  # noqa: BLE001 — 部分状态的形状可能不完整
+            summary = ""
+        status = "rejected" if exc.code == "APPROVAL_REJECTED" else "failed"
+        return PipelineOutcome(
+            task_id=task_id,
+            status=status,
+            blackboard=dict(state.get("blackboard") or {}),
+            node_results=node_results,
+            node_outputs=node_outputs,
+            summary=summary,
+            dag=dag,
+            total_tokens=sum(
+                r.get("tokens_used", {}).get("total", 0) for r in node_results
+            ),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            # 带上节点名：只报错误码会让「哪个节点挂的」无从判断
+            error=f"[{exc.code}] 节点 {exc.node_id}: {exc.message}",
+            call_records=_serialize_call_records(router),
+            error_code=exc.code,
+            retryable=exc.retryable,
+            revision=revision,
+        )
+
+    def _awaiting_outcome(
+        self,
+        task_id: str,
+        state: dict[str, Any],
+        requests: list[dict[str, Any]],
+        router,
+        started: float,
+        *,
+        revision: int = 1,
+    ) -> PipelineOutcome:
+        """构造「等待人工审批」的暂停结果（非终态）。"""
+        node_results = list(state.get("node_results") or [])
+        node_outputs = dict(state.get("node_outputs") or {})
+        dag = state.get("dag") or {}
+        try:
+            summary = _sink_summary(dag, node_outputs) if dag else ""
+        except Exception:  # noqa: BLE001
+            summary = ""
+        return PipelineOutcome(
+            task_id=task_id,
+            status="awaiting_approval",
+            blackboard=dict(state.get("blackboard") or {}),
+            node_results=node_results,
+            node_outputs=node_outputs,
+            summary=summary,
+            dag=dag,
+            total_tokens=sum(
+                r.get("tokens_used", {}).get("total", 0) for r in node_results
+            ),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            call_records=_serialize_call_records(router),
+            approval_requests=requests,
+            revision=revision,
+        )
+
+    async def load_saved_task(self, task_id: str) -> TaskEvent | None:
+        """从 checkpoint 读回任务的原始 TaskEvent（API 重启后审批/恢复用）。
+
+        thread_id 就是 API 的 task_id（提交时只创建一次 TaskEvent），因此进程重启后
+        仍能把「哪个任务、什么预算、什么截止时间」从 PostgreSQL 找回来。
+        """
+        from psycopg.rows import dict_row
+        from psycopg_pool import AsyncConnectionPool
+
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+        pool = AsyncConnectionPool(
+            conninfo=self.settings.postgres_dsn,
+            max_size=2,
+            open=False,
+            kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+        )
+        await pool.open()
+        try:
+            saver = AsyncPostgresSaver(pool)
+            await saver.setup()
+            state = await self._read_checkpoint_state(
+                saver, {"configurable": {"thread_id": task_id}}
+            )
+        finally:
+            await pool.close()
+        raw = state.get("task_event")
+        if not raw:
+            return None
+        return TaskEvent.model_validate(raw)
 
     async def _sink_memory(self, outcome: PipelineOutcome) -> None:
         try:
@@ -684,26 +1189,44 @@ class AnalysisPipeline:
             )
 
     async def _plan(
-        self, ctx: AgentContext, event: TaskEvent, task_id: str
+        self,
+        ctx: AgentContext,
+        event: TaskEvent,
+        task_id: str,
+        *,
+        previous: SubtaskDAG | None = None,
+        failure: PipelineNodeFailed | None = None,
+        revision: int = 1,
     ) -> tuple[SubtaskDAG, PipelineState]:
-        """图外先跑 Planner，返回校验过的 DAG 与图执行的初始状态。"""
+        """图外先跑 Planner，返回校验过的 DAG 与图执行的初始状态。
+
+        `previous/failure/revision` 用于**有界重规划**：把上一版 DAG 与失败原因
+        交给 Planner，产出一版新的拆解；`revision` 由代码写死（不要交给模型自由填）。
+        """
         planner = ctx.registry.get("planner")
         if planner is None:
             raise PipelinePlanError("注册表中缺少 planner，无法规划任务图")
 
         await self._emit("node_started", node_id=PLANNER_NODE_ID, agent_role="planner")
+        inputs: dict[str, Any] = {
+            "question": event.payload.text,
+            "schema": ctx.sandbox.schema_as_prompt_text(),
+            "now": datetime.now(TZ_CN).isoformat(timespec="seconds"),
+            # 让 Planner 知道哪些角色真的可执行，避免规划出跑不了的节点
+            "available_roles": sorted(
+                role for role in ctx.registry if role != "planner"
+            ),
+        }
+        if previous is not None and failure is not None:
+            inputs["previous_dag"] = previous.model_dump(mode="json")
+            inputs["failure_reason"] = (
+                f"[{failure.code}] 节点 {failure.node_id}: {failure.message}"
+            )
+            inputs["revision"] = revision
         inv = self._make_invocation(
             PLANNER_NODE_ID,
             "planner",
-            {
-                "question": event.payload.text,
-                "schema": ctx.sandbox.schema_as_prompt_text(),
-                "now": datetime.now(TZ_CN).isoformat(timespec="seconds"),
-                # 让 Planner 知道哪些角色真的可执行，避免规划出跑不了的节点
-                "available_roles": sorted(
-                    role for role in ctx.registry if role != "planner"
-                ),
-            },
+            inputs,
             task_id=task_id,
             budget=event.budget,
         )
@@ -720,6 +1243,10 @@ class AnalysisPipeline:
         )
 
         dag = SubtaskDAG.model_validate(result.outputs["dag"])
+        if revision > 1:
+            # revision 由编排层决定，不交给模型自由填（契约：重规划次数，递增可追溯）
+            dag = dag.model_copy(update={"revision": revision})
+            result.outputs["dag"] = dag.model_dump(mode="json", exclude_none=True)
         initial: PipelineState = {
             "task_event": to_wire(event),
             "now": datetime.now(TZ_CN).isoformat(timespec="seconds"),
@@ -727,6 +1254,10 @@ class AnalysisPipeline:
             "node_outputs": delta["node_outputs"],
             "blackboard": delta["blackboard"],
             "node_results": delta["node_results"],
+            # Planner 在图外跑，也消耗一步与它的 token
+            "steps_used": 1,
+            "tokens_used": result.tokens_used.total,
+            "dag_hash": self._dag_hash(result.outputs["dag"]),
         }
         return dag, initial
 
@@ -759,17 +1290,35 @@ def _serialize_call_records(router) -> list[dict[str, Any]]:
     return [asdict(record) for record in getattr(router, "history", [])]
 
 
-def new_task_event(question: str, *, deadline_minutes: int = 5) -> TaskEvent:
-    """构造一个 REST 渠道的 TaskEvent，便于本地跑链路。"""
+def new_task_event(
+    question: str,
+    *,
+    deadline_minutes: int = 5,
+    settings: Settings | None = None,
+    task_id: str | None = None,
+) -> TaskEvent:
+    """构造一个 REST 渠道的 TaskEvent，便于本地跑链路。
+
+    预算从 Settings 派生（`D2=60,000` 等），与契约默认的 200,000 区分开：
+    契约里 200,000 是「未指定时的上限」，实际执行的熔断口径由 D2 决定。
+    `task_id` 可用于**恢复**场景：API 层必须复用原始 id（= checkpointer 的
+    thread_id），不能每次重新生成。
+    """
     from ..contracts import Budget, Payload, Sensitivity, Source, SourceChannel, User, UserRole
 
+    cfg = settings or get_settings()
     now = datetime.now(TZ_CN)
     return TaskEvent(
-        task_id=uuid.uuid4(),
+        task_id=task_id or str(uuid.uuid4()),
         source=Source(channel=SourceChannel.rest_api),
         submitted_at=now,
         user=User(user_id="local_dev", roles=[UserRole.business_user]),
         payload=Payload(text=question),
         sensitivity=Sensitivity.internal,
-        budget=Budget(deadline=now + timedelta(minutes=deadline_minutes)),
+        budget=Budget(
+            max_steps=cfg.default_max_steps,
+            max_tokens=cfg.default_max_tokens,
+            max_retries=cfg.default_max_retries,
+            deadline=now + timedelta(minutes=deadline_minutes),
+        ),
     )

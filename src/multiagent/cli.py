@@ -116,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     settings = Settings()
-    event = new_task_event(args.question)
+    event = new_task_event(args.question, settings=settings)
     print(f"▶ 提交需求：{args.question}")
     print(f"▶ 模型：{settings.primary.provider}/{settings.primary.model} "
           f"（备用 {settings.fallback.provider}/{settings.fallback.model}）\n")

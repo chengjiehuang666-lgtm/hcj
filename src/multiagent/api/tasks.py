@@ -16,7 +16,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 # 终态：不再产生新事件
-TERMINAL_STATUSES = frozenset({"ok", "failed"})
+# 终态：不再产生新事件。awaiting_approval 是**非终态**（HITL 暂停）
+TERMINAL_STATUSES = frozenset({"ok", "failed", "rejected"})
 
 
 def _now_iso() -> str:
@@ -27,12 +28,17 @@ def _now_iso() -> str:
 class TaskRecord:
     task_id: str
     question: str
-    status: str = "pending"  # pending | running | ok | failed
+    # pending | running | awaiting_approval | ok | failed | rejected
+    status: str = "pending"
     created_at: str = field(default_factory=_now_iso)
     finished_at: str | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
     result: dict[str, Any] | None = None
     error: str | None = None
+    #: 原始 TaskEvent（提交时创建一次）：HITL 恢复必须复用同一 task_id/预算/deadline
+    task_event: Any = None
+    #: 待批请求（status=awaiting_approval 时由 pipeline 给出）
+    approval_requests: list[dict[str, Any]] = field(default_factory=list)
     subscribers: list[asyncio.Queue] = field(default_factory=list)
 
     @property
@@ -57,6 +63,7 @@ class TaskRecord:
             "created_at": self.created_at,
             "finished_at": self.finished_at,
             "error": self.error,
+            "approval_requests": self.approval_requests,
             "result": self.result,
             "event_count": len(self.events),
         }

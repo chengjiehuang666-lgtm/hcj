@@ -44,12 +44,61 @@ class FakePipeline:
         *,
         should_fail: bool = False,
         with_review: bool = False,
+        with_approval: bool = False,
     ) -> None:
         self._on_event = on_event
         self._should_fail = should_fail
         self._with_review = with_review
+        self._with_approval = with_approval
+        self.resumes: list[dict] = []
 
-    async def run(self, event):
+    async def run(self, event, *, resume: bool = False, resume_value=None):
+        if self._with_approval and resume_value is None:
+            if self._on_event:
+                await self._on_event(
+                    "node_started", {"node_id": "writer_1", "agent_role": "writer"}
+                )
+                await self._on_event(
+                    "node_finished",
+                    {"node_id": "writer_1", "agent_role": "writer", "status": "ok", "tokens": 10},
+                )
+            return PipelineOutcome(
+                task_id=str(event.task_id),
+                status="awaiting_approval",
+                approval_requests=[
+                    {
+                        "id": "i1",
+                        "value": {
+                            "kind": "node_approval",
+                            "node_id": "writer_1",
+                            "outputs": {"summary": "待签发的文档"},
+                        },
+                    }
+                ],
+            )
+        if self._with_approval and resume_value is not None:
+            self.resumes.append(dict(resume_value))
+            if self._on_event:
+                await self._on_event(
+                    "node_finished",
+                    {"node_id": "writer_1", "agent_role": "writer", "status": "ok", "tokens": 5},
+                )
+            return PipelineOutcome(
+                task_id=str(event.task_id),
+                status="rejected" if resume_value.get("decision") == "rejected" else "ok",
+                summary=f"决策:{resume_value.get('decision')}",
+                total_tokens=15,
+                duration_ms=120,
+                approvals={"writer_1": dict(resume_value)},
+                node_results=[
+                    {
+                        "node_id": "writer_1",
+                        "agent_role": "writer",
+                        "status": "ok",
+                        "outputs": {"summary": "文档正文"},
+                    }
+                ],
+            )
         if self._on_event:
             # 与真实链路一致：planner 在图外先跑，DAG 有两个并行检索 + 一个分析
             for node_id, role in (
@@ -133,10 +182,12 @@ class FakePipeline:
         )
 
 
-def _client(*, should_fail: bool = False) -> TestClient:
+def _client(*, should_fail: bool = False, with_approval: bool = False) -> TestClient:
     app = create_app(
         settings=Settings(_env_file=None),
-        pipeline_factory=lambda s, on_event: FakePipeline(s, on_event, should_fail=should_fail),
+        pipeline_factory=lambda s, on_event: FakePipeline(
+            s, on_event, should_fail=should_fail, with_approval=with_approval
+        ),
     )
     return TestClient(app)
 
@@ -144,9 +195,17 @@ def _client(*, should_fail: bool = False) -> TestClient:
 def _wait_finished(client: TestClient, task_id: str, tries: int = 50) -> dict:
     for _ in range(tries):
         body = client.get(f"/tasks/{task_id}").json()
-        if body["status"] in ("ok", "failed"):
+        if body["status"] in ("ok", "failed", "rejected"):
             return body
     raise AssertionError(f"任务未在预期内结束: {body}")
+
+
+def _wait_status(client: TestClient, task_id: str, status: str, tries: int = 100) -> dict:
+    for _ in range(tries):
+        body = client.get(f"/tasks/{task_id}").json()
+        if body["status"] == status:
+            return body
+    raise AssertionError(f"任务未达到状态 {status}: {body}")
 
 
 # ------------------------------------------------------------------ 健康检查
@@ -301,3 +360,68 @@ def test_every_event_is_valid_sse_with_json_data() -> None:
         data_line = next((ln for ln in lines if ln.startswith("data: ")), None)
         assert data_line, block
         json.loads(data_line.removeprefix("data: "))  # 必须是合法 JSON
+
+
+# ------------------------------------------------------------------ HITL 审批（W7）
+
+def test_approval_flow_pauses_then_resumes() -> None:
+    """暂停（非终态）→ POST 批准 → 恢复执行 → 终态；事件流完整。"""
+    client = _client(with_approval=True)
+    task_id = client.post("/tasks", json={"question": "写一份对外公告并发送给客户"}).json()["task_id"]
+
+    paused = _wait_status(client, task_id, "awaiting_approval")
+    assert paused["approval_requests"], "暂停时必须给出待批请求（节点、产物）"
+    assert paused["approval_requests"][0]["value"]["node_id"] == "writer_1"
+    assert paused["finished_at"] is None, "暂停不是终态，不得置 finished_at"
+
+    resp = client.post(
+        f"/tasks/{task_id}/approval", json={"decision": "approved", "comment": "同意"}
+    )
+    assert resp.status_code == 202
+
+    final = _wait_finished(client, task_id)
+    assert final["status"] == "ok"
+    assert "决策:approved" in final["result"]["summary"]
+
+    with client.stream("GET", f"/tasks/{task_id}/events") as response:
+        payload = "".join(response.iter_text())
+    assert "event: approval_required" in payload
+    assert "event: approval_received" in payload
+    assert "event: task_finished" in payload
+
+
+def test_approval_rejected_marks_task_rejected() -> None:
+    client = _client(with_approval=True)
+    task_id = client.post("/tasks", json={"question": "写一份对外公告"}).json()["task_id"]
+    _wait_status(client, task_id, "awaiting_approval")
+
+    client.post(f"/tasks/{task_id}/approval", json={"decision": "rejected", "comment": "不行"})
+    final = _wait_finished(client, task_id)
+    assert final["status"] == "rejected", "驳回是独立终态（不是 failed）"
+
+
+def test_approval_conflict_when_task_not_waiting() -> None:
+    client = _client()
+    task_id = client.post("/tasks", json={"question": "q"}).json()["task_id"]
+    _wait_finished(client, task_id)
+
+    resp = client.post(f"/tasks/{task_id}/approval", json={"decision": "approved"})
+    assert resp.status_code == 409
+
+
+def test_approval_rewritten_requires_outputs() -> None:
+    client = _client(with_approval=True)
+    task_id = client.post("/tasks", json={"question": "q"}).json()["task_id"]
+    _wait_status(client, task_id, "awaiting_approval")
+
+    resp = client.post(f"/tasks/{task_id}/approval", json={"decision": "rewritten"})
+    assert resp.status_code == 422
+
+
+def test_awaiting_status_is_not_terminal() -> None:
+    """暂停状态不得被当成终态：SSE 才不会提前收尾。"""
+    from multiagent.api.tasks import TERMINAL_STATUSES, TaskRecord
+
+    assert "awaiting_approval" not in TERMINAL_STATUSES
+    record = TaskRecord(task_id="t", question="q", status="awaiting_approval")
+    assert record.finished is False

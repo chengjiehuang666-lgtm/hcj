@@ -19,6 +19,21 @@ from ..contracts import AgentInvocation, AgentResult, AgentRole, SourceRef, Sour
 from ..gateway import ROUTE_PLANNER
 from .base import AgentContext, BaseAgent, _Usage
 
+#: 「高风险动作」的关键词：命中且 DAG 无审批节点 → 拒绝规划（代码门禁）
+_HUMAN_APPROVAL_KEYWORDS = (
+    "对外发送",
+    "发送给",
+    "签发",
+    "发布",
+    "群发",
+    "公告",
+    "对外",
+    "转账",
+    "付款",
+    "修改数据",
+    "删除数据",
+)
+
 SYSTEM_PROMPT = """你是任务规划专家，负责把业务分析需求拆解为可由专家 Agent 执行的有向无环任务图。
 
 **可用角色以用户消息里给出的 available_roles 为准，不得规划除此之外的角色。**
@@ -62,7 +77,9 @@ SYSTEM_PROMPT = """你是任务规划专家，负责把业务分析需求拆解�
 5. 分析类需求**必须以 reviewer 节点收尾**，且 reviewer 的 depends_on 列出图中其余
    全部节点；文档类需求必须以 writer 收尾链路（writer → reviewer）收尾；
    节点数量控制在 3-5 个（含 memory 检索时可到 5 个）。
-6. 输出必须是单个 JSON 对象，不要 markdown 围栏，不要任何解释文字。
+6. 涉及**对外发送、资金/数据变更、文档签发**的节点，必须把
+   `requires_human_approval` 置为 true；其余节点写 false（不写按 false 处理）。
+7. 输出必须是单个 JSON 对象，不要 markdown 围栏，不要任何解释文字。
 
 输出结构（严格遵守字段名）：
 {
@@ -77,7 +94,8 @@ SYSTEM_PROMPT = """你是任务规划专家，负责把业务分析需求拆解�
     {"node_id": "analyst_1", "name": "取数并归因", "agent_role": "analyst",
      "depends_on": ["retriever_1", "retriever_2"], "inputs": {}, "outputs": {}, "acceptance": ["..."]},
     {"node_id": "reviewer_1", "name": "交叉校验结论", "agent_role": "reviewer",
-     "depends_on": ["retriever_1", "retriever_2", "analyst_1"], "inputs": {}, "outputs": {}, "acceptance": ["..."]}
+     "depends_on": ["retriever_1", "retriever_2", "analyst_1"], "inputs": {}, "outputs": {},
+     "acceptance": ["..."], "requires_human_approval": false}
   ]
 }"""
 
@@ -152,6 +170,16 @@ class PlannerAgent(BaseAgent):
             )
 
         if reason := self._validate_retriever_modes(dag):
+            return self.failed(
+                inv,
+                code="UNSUPPORTED_PLAN",
+                message=reason,
+                retryable=True,
+                usage=usage,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+
+        if reason := self._validate_human_approval(dag, question):
             return self.failed(
                 inv,
                 code="UNSUPPORTED_PLAN",
@@ -244,6 +272,23 @@ class PlannerAgent(BaseAgent):
         if duplicated:
             return f"retriever 节点的 inputs.mode 重复: {sorted(duplicated)}；每个模式只应出现一次。"
         return None
+
+    @staticmethod
+    def _validate_human_approval(dag: SubtaskDAG, question: str) -> str | None:
+        """高风险请求必须规划出审批节点——**代码门禁**，不只靠提示词。
+
+        W6 独立复核的教训：reviewer 依赖完整性只写在提示词里，模型漏了就静默降级。
+        这里对「对外发送 / 签发 / 资金或数据变更」类请求做可判定的检查。
+        """
+        risky = [kw for kw in _HUMAN_APPROVAL_KEYWORDS if kw in question]
+        if not risky:
+            return None
+        if any(n.requires_human_approval for n in dag.nodes):
+            return None
+        return (
+            f"问题含高风险动作（{risky}），但 DAG 没有任何 requires_human_approval=true 的节点；"
+            "请把对应节点（如 writer / analyst）标记为需要人工审批。"
+        )
 
     @staticmethod
     def _validate_reviewer_scope(dag: SubtaskDAG) -> str | None:
