@@ -324,6 +324,14 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
         event = new_task_event(case.question, settings=settings)
         try:
             outcome = await pipeline.run(event)
+            # HITL：评测没有人工审批，遇到合法暂停时**自动批准**（模拟审批人），
+            # 让「暂停→恢复」的完整链路也被评测覆盖，而不是把暂停判成失败。
+            if outcome.status == "awaiting_approval":
+                outcome = await pipeline.run(
+                    event,
+                    resume=True,
+                    resume_value={"decision": "approved", "comment": "评测自动批准"},
+                )
         except Exception as exc:  # 单条用例失败不应中断整轮评测
             # 记录完整栈：只留一句异常消息会让间歇性崩溃无从排查
             import traceback
