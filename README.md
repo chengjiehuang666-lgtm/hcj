@@ -1,6 +1,6 @@
 # 多 Agent 接入协作项目
 
-企业级多 Agent 智能协作平台。当前处于**阶段二（动态编排 + 多 Agent 协同 + 异常处理/HITL，W7 完成）**（单人全职开发，计划与范围见《实施路线图》）。
+企业级多 Agent 智能协作平台。**阶段二已收口（W8 完成：50 条评测集 + 三层压测）**（单人全职开发，计划与范围见《实施路线图》）。
 
 ## 唯一事实源
 
@@ -33,7 +33,7 @@
 │   ├── tools/                 # SQL 沙箱（只读角色）与 Python 沙箱（容器隔离）
 │   ├── rag/                   # 知识库：本地 embedding + pgvector + pg_trgm 混合检索
 │   ├── memory/                # 长期记忆：评审门槛后沉淀、跨会话检索（与知识库分表）
-│   ├── eval/                  # 评测集与执行器（27 条用例 + 打分器）
+│   ├── eval/                  # 评测集与执行器（50 条用例）+ 三层压测工具
 │   ├── api/                   # REST + SSE 入口
 │   └── cli.py                 # 命令行入口
 ├── tests/                     # 契约一致性、引擎、Agent、记忆、网关等单测
@@ -63,12 +63,14 @@
    拦下），适合作为快速档/兜底，不适合承担规划与归因。两个档位的主备都指向同一个
    本地端点，因此**本地服务是可用性单点**。
 2. **无远端仓库**：回档能力目前仅限本机（见《实施路线图》风险 R12）。
-3. **时延与成功率相互牵制，W6/W7 明码选择「保质量」**：
-   - **成功率 26/27 = 96.3%**（24 条分析 + 2 条文档 + 1 条跨会话记忆）。W7 唯一失败
-     `doc_return_policy_notice` 的原因是 Planner 把「内部通知」误标为需审批 → 任务暂停
-     （评测侧自动批准 + 提示词收敛后单跑通过），不是能力问题
-   - P50 **53.0 秒**，P95 126.5 秒仍未达标；reviewer 占模型调用耗时约 50%——
-     这是「强制必审」的明码代价，如实记录、不追时延
+3. **时延与成功率相互牵制，W6–W8 明码选择「保质量」**：
+   - **W8 全量 49/50 = 98.0%**（分析 28/29、文档 20/20、跨会话记忆 1/1）；唯一失败
+     `peak_month` 是 fast 档连续两次生成多语句 SQL 被沙箱拒绝，单跑通过——
+     模型质量波动，不是链路缺陷
+   - P50 **66.6 秒**，P95 111.9 秒仍未达 M1 的 60 秒线；reviewer 占模型调用耗时
+     **41%**、writer 19%——这是「强制必审」与第二个场景的明码代价，如实记录、不追时延
+   - **瓶颈已在 W8 定位**：应用编排层可撑 32 并发（P50 5.6 秒，65 条 DB 连接），
+     真正的天花板是本地模型端点——**并发硬上限 6**（N=7 起 HTTP 503 `no_healthy_account`）
 4. **W7 能力的边界（如实记录）**：熔断与 HITL 均为**后端**能力——熔断后任务
    终止于稳定错误码（`BUDGET_EXCEEDED`/`STEP_LIMIT`/`DEADLINE_EXCEEDED`），
    单租户没有审批队列；HITL 只覆盖 `requires_human_approval` 节点的**审批门**，
@@ -83,6 +85,10 @@
    网关对此**显式报错**（`EmptyCompletionError`），不会静默返回空字符串——
    静默失败会让上游误以为模型「没话说」。`LLMResponse.reasoning_tokens` 单独记录了
    思考 token，供成本计量使用。
+6. **W8 的边界（如实记录）**：评测到 50 条，但**只有一轮全量**（单条失败重跑即过，
+   波动方差未估计）；评审 verdict 中文档体裁 8/20 fail（只影响记忆沉淀，不影响交付），
+   **按体裁校准仍然未做**；第 3 个场景（D6）截止周已到仍未拍板；压测只覆盖单进程，
+   任务注册表与 SSE 不跨进程；端点备选接管演练（O12）留待 W9。
 
 ## 快速开始
 
@@ -109,7 +115,12 @@ python -m multiagent.rag.ingest --stats
 
 # 6. 跑一条端到端任务 / 评测回归
 python -m multiagent.cli "分析上月华东区销售额下滑的原因"
-python -m multiagent.eval.runner --limit 3        # 全量 27 条约 45 分钟
+python -m multiagent.eval.runner --limit 3        # 全量 50 条约 55 分钟
+python -m multiagent.eval.runner --scenario document   # 只跑文档子集（20 条）
+python -m multiagent.eval.loadtest --mode pipeline --levels 1,4,8,16,32 --tasks-per-level 32
+                                                  # W8 压测：不烧 token 的编排层瓶颈定位
+python -m multiagent.eval.loadtest --mode model --levels 6,7 --tasks-per-level 12
+                                                  # 模型端点并发膝点（tasks 必须 ≥ 档位）
 python -m multiagent.memory --stats               # 长期记忆维护（--search / --clear）
 ```
 
