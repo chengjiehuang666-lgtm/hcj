@@ -167,6 +167,13 @@ def create_app(
     app_settings = settings or Settings()
     factory = pipeline_factory or _default_pipeline_factory
     registry = TaskRegistry()
+    #: 后台任务必须保存强引用：fire-and-forget 的 Task 存在被 GC 回收的风险
+    background_tasks: set = set()
+
+    def _spawn(coro) -> None:
+        task = asyncio.create_task(coro)
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
 
     app = FastAPI(
         title="多 Agent 智能协作平台（MVP 入口）",
@@ -243,7 +250,7 @@ def create_app(
             request.question, settings=app_settings, task_id=task_id
         )
         # 后台执行，不阻塞提交响应——这是 SSE 能实时推送的前提
-        asyncio.create_task(_execute(record))
+        _spawn(_execute(record))
         return SubmitResponse(
             task_id=task_id,
             status=record.status,
@@ -297,7 +304,7 @@ def create_app(
             "comment": body.comment,
             "outputs": body.outputs,
         }
-        asyncio.create_task(_execute(record, resume_value=resume_value))
+        _spawn(_execute(record, resume_value=resume_value))
         return {"task_id": task_id, "status": "running"}
 
     @app.get("/tasks")

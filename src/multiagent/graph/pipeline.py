@@ -892,6 +892,10 @@ class AnalysisPipeline:
 
         pool = AsyncConnectionPool(
             conninfo=self.settings.postgres_dsn,
+            # min_size 必须显式给 1：psycopg_pool 默认 min_size=4，N 个并发任务
+            # 会占 4N 条连接（PG max_connections=100 → 约 24 并发即触顶）。
+            # 压测（W8）前修正；进程级共享 checkpointer 池属后续优化。
+            min_size=1,
             max_size=4,
             open=False,
             kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
@@ -1153,6 +1157,9 @@ class AnalysisPipeline:
 
         pool = AsyncConnectionPool(
             conninfo=self.settings.postgres_dsn,
+            # max_size=2 时必须显式 min_size≤2：默认 min_size=4 会让构造直接抛
+            # ValueError（W7 缺陷：进程重启后的审批恢复因此 404）
+            min_size=1,
             max_size=2,
             open=False,
             kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
@@ -1208,9 +1215,12 @@ class AnalysisPipeline:
             raise PipelinePlanError("注册表中缺少 planner，无法规划任务图")
 
         await self._emit("node_started", node_id=PLANNER_NODE_ID, agent_role="planner")
+        # schema 自省是**同步 psycopg**调用：直接跑会冻结整个事件循环（W5 只修了
+        # Retriever）。并发下一条慢查询会让所有任务的 SSE/轮询一起停顿。
+        schema_text = await asyncio.to_thread(ctx.sandbox.schema_as_prompt_text)
         inputs: dict[str, Any] = {
             "question": event.payload.text,
-            "schema": ctx.sandbox.schema_as_prompt_text(),
+            "schema": schema_text,
             "now": datetime.now(TZ_CN).isoformat(timespec="seconds"),
             # 让 Planner 知道哪些角色真的可执行，避免规划出跑不了的节点
             "available_roles": sorted(

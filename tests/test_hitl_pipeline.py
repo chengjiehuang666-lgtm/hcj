@@ -170,3 +170,28 @@ def test_run_maps_rejection_to_rejected_status(monkeypatch) -> None:
     assert second.status == "rejected", "驳回是独立终态，不是 failed"
     assert "人工驳回" in (second.error or "")
     assert not any(r["agent_role"] == "reviewer" for r in second.node_results)
+
+
+def test_load_saved_task_reads_event_from_checkpoint(monkeypatch) -> None:
+    """进程重启后的审批恢复依赖它：从 checkpoint 读回原始 TaskEvent。
+
+    W7 实现里这里有个致命参数错误（max_size=2 < 默认 min_size=4 → 构造抛
+    ValueError，被上层 except 吞掉后表现为 404）；本测试钉住修复。
+    """
+    _skip_if_db_unreachable()
+    from multiagent.graph import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "build_agent_registry", _fake_registry)
+    pipeline = AnalysisPipeline(_test_settings)
+    question = "写一份对外公告并发送给客户"
+    event = new_task_event(question, settings=_test_settings)
+
+    first = run_async(pipeline.run(event))
+    assert first.status == "awaiting_approval"
+
+    loaded = run_async(pipeline.load_saved_task(str(event.task_id)))
+    assert loaded is not None, "必须能从 checkpoint 读回任务事件"
+    assert loaded.payload.text == question
+    assert str(loaded.task_id) == str(event.task_id)
+
+    assert run_async(pipeline.load_saved_task("no-such-thread")) is None

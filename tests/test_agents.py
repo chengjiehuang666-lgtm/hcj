@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
 from datetime import datetime, timedelta, timezone
@@ -834,3 +835,115 @@ def test_planner_plain_request_needs_no_approval() -> None:
     gateway = FakeGateway(_plan_with_retrievers("metrics", "knowledge"))
     result = asyncio.run(PlannerAgent().invoke(_invocation(), _ctx(gateway)))
     assert result.status is ResultStatus.ok, result.error
+
+
+# ------------------------------------------------ W8：同步调用不得冻结事件循环
+
+
+def test_analyst_sql_execution_does_not_block_event_loop() -> None:
+    """SQL 执行是同步 psycopg——必须走线程。
+
+    W8 压测前发现：Analyst 的 `sandbox.execute()` 直接跑在事件循环上，一条慢 SQL
+    会让所有并发任务与 SSE 一起停摆（W5 只修了 Retriever）。
+    """
+    import asyncio
+    import time
+
+    from multiagent.agents import AnalystAgent
+    from multiagent.tools.sql import SqlResult
+
+    class SlowSandbox:
+        def execute(self, sql):  # 同步阻塞 0.3 秒
+            time.sleep(0.3)
+            return SqlResult(sql=sql, sql_hash="sha256:test", rows=[{"x": 1}], row_count=1)
+
+    gateway = FakeGateway(
+        '{"sql": "SELECT 1 AS x", "rationale": "t"}',
+        '{"summary": "x=1", "key_findings": ["x=1"], "insufficient_data": false, "confidence": 0.9}',
+    )
+    inv = _node_invocation("analyst_1", "analyst")
+    ctx = AgentContext(settings=settings, gateway=gateway, sandbox=SlowSandbox())
+
+    ticks = 0
+    state = {"stop": False}
+
+    async def scenario() -> None:
+        nonlocal ticks
+
+        async def heartbeat() -> None:
+            nonlocal ticks
+            while not state["stop"]:
+                ticks += 1
+                await asyncio.sleep(0.005)
+
+        hb = asyncio.create_task(heartbeat())
+        try:
+            result = await AnalystAgent().invoke(inv, ctx)
+            assert result.status is ResultStatus.ok, result.error
+        finally:
+            state["stop"] = True
+            await hb
+
+    asyncio.run(scenario())
+    assert ticks >= 10, f"SQL 执行占住了事件循环（心跳仅 {ticks} 次）"
+
+
+def test_planner_schema_introspection_does_not_block_event_loop() -> None:
+    """Planner 的表结构自省同样是同步 psycopg——必须走线程（W8）。"""
+    import asyncio
+    import time
+
+    from multiagent.agents.base import _Usage
+    from multiagent.contracts import SourceRef, SourceType
+    from multiagent.graph.pipeline import AnalysisPipeline, new_task_event
+
+    class SlowSandbox:
+        def schema_as_prompt_text(self):  # 同步阻塞 0.3 秒
+            time.sleep(0.3)
+            return "- sales(region, revenue)"
+
+    class InstantPlanner(PlannerAgent):
+        async def invoke(self, inv, ctx):  # 跳过模型，直接给合法 DAG
+            return self.ok(
+                inv,
+                outputs={
+                    "dag": json.loads(
+                        _dag_json([("retriever_1", "retriever", [])])
+                    ),
+                    "node_count": 1,
+                },
+                sources=[SourceRef(type=SourceType.model_inference, ref="test")],
+                usage=_Usage(),
+                duration_ms=1,
+            )
+
+    pipeline = AnalysisPipeline(settings)
+    ctx = AgentContext(
+        settings=settings,
+        gateway=FakeGateway(),
+        sandbox=SlowSandbox(),
+        registry={"planner": InstantPlanner()},
+    )
+    event = new_task_event("分析一下", settings=settings)
+
+    ticks = 0
+    state = {"stop": False}
+
+    async def scenario() -> None:
+        nonlocal ticks
+
+        async def heartbeat() -> None:
+            nonlocal ticks
+            while not state["stop"]:
+                ticks += 1
+                await asyncio.sleep(0.005)
+
+        hb = asyncio.create_task(heartbeat())
+        try:
+            await pipeline._plan(ctx, event, "t-plan")
+        finally:
+            state["stop"] = True
+            await hb
+
+    asyncio.run(scenario())
+    assert ticks >= 10, f"表结构自省占住了事件循环（心跳仅 {ticks} 次）"

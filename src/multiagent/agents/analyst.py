@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 from pydantic import BaseModel, Field
@@ -225,7 +226,9 @@ class AnalystAgent(BaseAgent):
                         acceptance_text=acceptance_text,
                         repair_feedback=feedback,
                     )
-                    result = ctx.sandbox.execute(plan.sql)
+                    # SQL 执行是同步 psycopg：走线程，否则一条慢 SQL 会冻结
+                    # 整个事件循环（并发任务与 SSE 一起停摆）
+                    result = await asyncio.to_thread(ctx.sandbox.execute, plan.sql)
                 except SqlExecutionError as exc:
                     problems.append(f"第{attempts}次 SQL 被拒绝: {str(exc)[:200]}")
                     if best is not None:
