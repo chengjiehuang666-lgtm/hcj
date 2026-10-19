@@ -27,6 +27,7 @@ class FakeOutcome:
         row_count: int | None = 3,
         knowledge: list[dict] | None = None,
         memories: list[dict] | None = None,
+        document: str | None = None,
     ) -> None:
         self.status = status
         self.summary = summary
@@ -47,6 +48,15 @@ class FakeOutcome:
                 },
             },
         ]
+        if document is not None:
+            self.node_results.append(
+                {
+                    "node_id": "writer_1",
+                    "agent_role": "writer",
+                    "status": "ok",
+                    "outputs": {"document_markdown": document},
+                }
+            )
 
 
 # ------------------------------------------------------------------ 归一化
@@ -255,3 +265,143 @@ def test_memory_source_problem_noop_without_binding() -> None:
 
     plain = EvalCase(id="mem", question="q", expect_memories=["华东"])
     assert _memory_source_problem(plain, []) is None
+
+
+# ------------------------------------------------- W8：50 条规模与场景约束
+
+
+def test_case_set_meets_w8_scale_and_scenarios() -> None:
+    """W8：50 条，每场景 ≥20（文档 20 / 非文档 30）；结构性字段必须健全。"""
+    from multiagent.eval.cases import CASES
+    from multiagent.rag.corpus import DOCUMENTS
+
+    assert len(CASES) >= 50, f"W8 要求 50 条，当前 {len(CASES)}"
+    doc = [c for c in CASES if c.scenario == "document"]
+    non_doc = [c for c in CASES if c.scenario != "document"]
+    assert len(doc) >= 20, f"文档场景应 ≥20 条，当前 {len(doc)}"
+    assert len(non_doc) >= 30, f"非文档场景应 ≥30 条，当前 {len(non_doc)}"
+
+    for case in doc:
+        assert {"writer", "reviewer"} <= set(case.expect_roles), case.id
+        assert case.expect_docs and case.expect_any, case.id
+        assert case.require_knowledge, case.id
+
+    # expect_docs 必须能在语料里找到（拼错只会在运行期失败，这里提前拦住）
+    for case in CASES:
+        for exp in case.expect_docs:
+            assert any(exp in d.doc_id for d in DOCUMENTS), (
+                f"{case.id}: expect_docs {exp!r} 不在语料中"
+            )
+
+    # requires_case 必须指向存在的用例
+    ids = {c.id for c in CASES}
+    for case in CASES:
+        if case.requires_case:
+            assert case.requires_case in ids, (
+                f"{case.id}: requires_case {case.requires_case!r} 不存在"
+            )
+
+
+def test_document_markdown_is_graded() -> None:
+    """文档用例的断言必须落在 document_markdown 上（不能只靠 summary）。"""
+    case = EvalCase(
+        id="doc_x",
+        question="q",
+        scenario="document",
+        expect_any=[["96%"]],
+        expect_docs=["q2-2026-review"],
+        require_knowledge=True,
+        expect_roles=["writer", "reviewer"],
+    )
+    from types import SimpleNamespace
+
+    def outcome(document: str) -> FakeOutcome:
+        out = FakeOutcome(
+            document=document,
+            knowledge=[{"doc_id": "q2-2026-review"}],
+        )
+        out.node_results.append(
+            {"node_id": "reviewer_1", "agent_role": "reviewer", "status": "ok",
+             "outputs": {"verdict": "pass"}}
+        )
+        return out
+
+    assert grade(case, outcome("# 简报\n\nQ2 达成率 96%"))[0] is True
+    passed, failed, _, _ = grade(case, outcome("# 简报\n\n业绩良好"))
+    assert passed is False and any("96%" in f for f in failed)
+
+
+def test_sum_route_tokens_merges_segments() -> None:
+    """暂停/恢复是两段 run()：按调用点归因必须相加，否则报告低估成本。"""
+    from types import SimpleNamespace
+
+    from multiagent.eval.runner import _sum_route_tokens
+
+    seg1 = SimpleNamespace(
+        tokens_by_route={"planner": {"calls": 1, "total_tokens": 100}},
+        duration_ms=100,
+    )
+    seg2 = SimpleNamespace(
+        tokens_by_route={
+            "writer": {"calls": 1, "total_tokens": 300},
+            "planner": {"calls": 1, "total_tokens": 50},
+        },
+        duration_ms=200,
+    )
+    merged = _sum_route_tokens([seg1, seg2])
+    assert merged["planner"]["calls"] == 2
+    assert merged["planner"]["total_tokens"] == 150
+    assert merged["writer"]["total_tokens"] == 300
+
+
+def test_run_cases_auto_approves_multi_gate_and_merges_latency(monkeypatch) -> None:
+    """多个审批门：自动批准循环（≤3 次），且时延按分段相加。"""
+    import asyncio
+    from types import SimpleNamespace
+
+    from multiagent.eval import runner as runner_module
+    from multiagent.graph.pipeline import PipelineOutcome
+
+    class FakePipeline:
+        def __init__(self, settings):
+            self.calls = 0
+
+        async def run(self, event, *, resume=False, resume_value=None):
+            self.calls += 1
+            if self.calls <= 2:
+                return PipelineOutcome(
+                    task_id="t",
+                    status="awaiting_approval",
+                    duration_ms=100,
+                    approval_requests=[{"id": "i"}],
+                )
+            return PipelineOutcome(
+                task_id="t",
+                status="ok",
+                duration_ms=200,
+                total_tokens=10,
+                node_results=[
+                    {
+                        "agent_role": "writer",
+                        "status": "ok",
+                        "outputs": {"document_markdown": "达成率 96%"},
+                    }
+                ],
+                summary="",
+            )
+
+    monkeypatch.setattr(runner_module, "AnalysisPipeline", FakePipeline)
+    case = EvalCase(
+        id="doc_multi_gate",
+        question="q",
+        scenario="document",
+        expect_any=[["96%"]],
+    )
+    from multiagent.config import Settings
+
+    report = asyncio.run(runner_module.run_cases(Settings(_env_file=None), [case]))
+
+    result = report.results[0]
+    assert result.passed is True
+    assert result.latency_ms == 400, "三段 run() 的时延必须相加"
+    assert result.status == "ok"

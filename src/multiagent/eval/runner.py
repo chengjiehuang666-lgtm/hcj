@@ -75,6 +75,8 @@ class CaseResult:
     #: 按调用点（planner / analyst_sql / analyst_conclude）的成本与时延归因。
     #: 分级路由靠它决定哪些调用点值得切到 fast 档。
     route_tokens: dict[str, dict[str, int]] = field(default_factory=dict)
+    #: 场景归属（W8：每场景 ≥20 与分场景成功率）
+    scenario: str = "analysis"
     #: 检索阶段实际取到的知识文档与片段数——RAG 回归的结构性证据
     retrieved_docs: list[str] = field(default_factory=list)
     knowledge_count: int = 0
@@ -137,6 +139,21 @@ def _writer_outputs(outcome) -> dict:
     return merged
 
 
+def _sum_route_tokens(segments: list) -> dict[str, dict[str, int]]:
+    """把多次 run()（暂停/恢复分段）的按调用点归因相加。
+
+    批准恢复是**另一段** run()：它新建 router，call_records 只含恢复段。
+    不合并的话，planner/writer 的成本会从报告里消失。
+    """
+    total: dict[str, dict[str, int]] = {}
+    for seg in segments:
+        for route, stats in (getattr(seg, "tokens_by_route", None) or {}).items():
+            bucket = total.setdefault(route, {})
+            for key, value in stats.items():
+                bucket[key] = bucket.get(key, 0) + int(value)
+    return total
+
+
 def _memory_source_problem(case: EvalCase, results: list[CaseResult]) -> str | None:
     """记忆用例的前置条件：它依赖的前置用例必须本次**真的沉淀**。
 
@@ -183,8 +200,9 @@ def grade(case: EvalCase, outcome) -> tuple[bool, list[str], list[str], bool]:
             [
                 outcome.summary or "",
                 " ".join(outputs.get("key_findings", []) or []),
-                # 文档场景：产物本体是文档正文，断言必须能落在它上面
-                str(_writer_outputs(outcome).get("document_markdown") or "")[:3000],
+                # 文档场景：产物本体是文档正文，断言必须能落在它上面。
+                # 截断 8000：W7 实测 doc_q2 已 2869 字符，3000 会逼近上限。
+                str(_writer_outputs(outcome).get("document_markdown") or "")[:8000],
             ]
         )
     )
@@ -326,12 +344,20 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
             outcome = await pipeline.run(event)
             # HITL：评测没有人工审批，遇到合法暂停时**自动批准**（模拟审批人），
             # 让「暂停→恢复」的完整链路也被评测覆盖，而不是把暂停判成失败。
-            if outcome.status == "awaiting_approval":
+            # 循环处理多审批门（DAG 可能有多个 requires_human_approval 节点）；
+            # 每段都是独立的 run()，时延与调用点归因必须跨段合并。
+            segments = [outcome]
+            approvals_used = 0
+            while outcome.status == "awaiting_approval" and approvals_used < 3:
+                approvals_used += 1
                 outcome = await pipeline.run(
                     event,
                     resume=True,
                     resume_value={"decision": "approved", "comment": "评测自动批准"},
                 )
+                segments.append(outcome)
+            latency_ms = sum(int(seg.duration_ms or 0) for seg in segments)
+            route_tokens = _sum_route_tokens(segments)
         except Exception as exc:  # 单条用例失败不应中断整轮评测
             # 记录完整栈：只留一句异常消息会让间歇性崩溃无从排查
             import traceback
@@ -366,9 +392,10 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
             CaseResult(
                 case_id=case.id,
                 question=case.question,
+                scenario=case.scenario,
                 passed=passed,
                 status=outcome.status,
-                latency_ms=outcome.duration_ms,
+                latency_ms=latency_ms,
                 tokens=outcome.total_tokens,
                 input_tokens=outcome.total_input_tokens,
                 output_tokens=outcome.total_output_tokens,
@@ -379,7 +406,7 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
                 sql_hash=outputs.get("sql_hash"),
                 summary=(outcome.summary or "")[:200],
                 error=outcome.error,
-                route_tokens=outcome.tokens_by_route,
+                route_tokens=route_tokens,
                 retrieved_docs=sorted(set(docs)),
                 knowledge_count=len(docs),
                 review_verdict=verdict,
@@ -393,7 +420,7 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
             report.passed += 1
         print(
             f"{'PASS' if passed else 'FAIL'} "
-            f"{outcome.duration_ms / 1000:.1f}s {outcome.total_tokens}tok"
+            f"{latency_ms / 1000:.1f}s {outcome.total_tokens}tok"
             + (f"  未命中={failed}" if failed else "")
             + (f"  禁用词={forbidden}" if forbidden else "")
         )
@@ -425,6 +452,39 @@ def render_markdown(report: EvalReport) -> str:
     add(f"| P95 端到端时延 | {report.p95_latency_s:.1f} 秒 | ≤ 60 秒 | {'✅' if report.p95_latency_s <= 60 else '❌'} |")
     add(f"| 最大时延 | {report.max_latency_s:.1f} 秒 | ≤ 60 秒 | {'✅' if report.max_latency_s <= 60 else '❌'} |")
     add("")
+
+    # ---- 分场景成功率（W8 / M2 口径：总体 ≥90% 且文档场景 ≥90%） ----
+    by_scenario: dict[str, list[CaseResult]] = {}
+    for result in report.results:
+        by_scenario.setdefault(result.scenario, []).append(result)
+    if len(by_scenario) > 1:
+        add("## 分场景成功率（M2 口径）")
+        add("")
+        add("| 场景 | 用例 | 通过 | 成功率 | 门槛 | 结论 |")
+        add("| :--- | --: | --: | --: | :--- | :--- |")
+        for scenario, items in sorted(by_scenario.items()):
+            ok = sum(1 for item in items if item.passed)
+            rate = ok / len(items) if items else 0.0
+            if scenario == "memory":
+                gate, mark = "—（跨场景单列）", "—"
+            else:
+                gate = "≥90%"
+                mark = "✅" if rate >= 0.9 else "❌"
+            add(f"| {scenario} | {len(items)} | {ok} | {rate:.1%} | {gate} | {mark} |")
+        doc_items = by_scenario.get("document", [])
+        doc_rate = (
+            sum(1 for item in doc_items if item.passed) / len(doc_items)
+            if doc_items
+            else 0.0
+        )
+        m2_ok = report.success_rate >= 0.9 and doc_rate >= 0.9
+        add("")
+        add(
+            f"> **M2 成功率口径**：总体 {report.success_rate:.1%}"
+            f"（门槛 ≥90%）+ 文档场景 {doc_rate:.1%}（门槛 ≥90%）→ "
+            + ("✅ 双门槛达标" if m2_ok else "❌ 未同时达标")
+        )
+        add("")
 
     add("## D2 单任务 Token 成本")
     add("")
@@ -487,6 +547,8 @@ def render_markdown(report: EvalReport) -> str:
             add(f"### `{r.case_id}`")
             add(f"- 问题：{r.question}")
             add(f"- 状态：{r.status}；未命中：{r.failed_checks}；禁用词：{r.hit_forbidden}")
+            if r.retrieved_docs:
+                add(f"- 检索到：{', '.join(r.retrieved_docs)}")
             if r.error:
                 add(f"- 错误：{r.error}")
             if r.summary:
@@ -499,6 +561,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m multiagent.eval.runner")
     parser.add_argument("--ids", help="只跑指定用例，逗号分隔")
     parser.add_argument("--limit", type=int, help="只跑前 N 条")
+    parser.add_argument(
+        "--scenario",
+        choices=["analysis", "document", "memory"],
+        help="只跑某个场景（W8 起用于分场景冒烟与统计）",
+    )
     parser.add_argument("--out", default="eval_results", help="结果输出目录")
     parser.add_argument(
         "--no-prereq",
@@ -508,7 +575,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     ids = [s.strip() for s in args.ids.split(",")] if args.ids else None
-    cases = get_cases(ids=ids, limit=args.limit)
+    cases = get_cases(ids=ids, limit=args.limit, scenario=args.scenario)
     if not cases:
         print("没有匹配的用例")
         return 1
