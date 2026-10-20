@@ -1,6 +1,6 @@
 # 多 Agent 接入协作项目
 
-企业级多 Agent 智能协作平台。**阶段二已收口（W8 完成：50 条评测集 + 三层压测）**（单人全职开发，计划与范围见《实施路线图》）。
+企业级多 Agent 智能协作平台。**阶段三进行中（W9 安全基线完成：输入过滤 + 输出 DLP + API Key 角色权限）**（单人全职开发，计划与范围见《实施路线图》）。
 
 ## 唯一事实源
 
@@ -34,6 +34,7 @@
 │   ├── rag/                   # 知识库：本地 embedding + pgvector + pg_trgm 混合检索
 │   ├── memory/                # 长期记忆：评审门槛后沉淀、跨会话检索（与知识库分表）
 │   ├── eval/                  # 评测集与执行器（50 条用例）+ 三层压测工具
+│   ├── security/              # W9：输入过滤、输出 DLP、API Key 角色权限
 │   ├── api/                   # REST + SSE 入口
 │   └── cli.py                 # 命令行入口
 ├── tests/                     # 契约一致性、引擎、Agent、记忆、网关等单测
@@ -122,7 +123,7 @@ python -m multiagent.eval.runner --limit 3        # 全量 50 条约 55 分钟
 python -m multiagent.eval.runner --scenario document   # 只跑文档子集（20 条）
 python -m multiagent.eval.loadtest --mode pipeline --levels 1,4,8,16,32 --tasks-per-level 32
                                                   # W8 压测：不烧 token 的编排层瓶颈定位
-python -m multiagent.eval.loadtest --mode model --levels 6,7 --tasks-per-level 12
+python -m multiagent.eval.loadtest --mode model --levels 12,16,20 --tasks-per-level 20
                                                   # 模型端点并发膝点（tasks 必须 ≥ 档位）
 python -m multiagent.memory --stats               # 长期记忆维护（--search / --clear）
 ```
@@ -134,17 +135,43 @@ python -m multiagent.memory --stats               # 长期记忆维护（--searc
 审批后从同一 checkpoint 恢复：
 
 ```bash
+# 以下示例假设已在 .env 配置 API_KEYS，并导出操作员/管理员的 Key：
+#   export API_KEY=<operator 或 admin 的 key>
 # 提交（命中高风险关键词会暂停）
-curl -s -X POST localhost:8000/tasks -H "Content-Type: application/json"      -d '{"question":"写一份对外公告并发送给客户"}'
+curl -s -X POST localhost:8000/tasks \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  -d '{"question":"写一份对外公告并发送给客户"}'
 # → {"task_id":"...","status":"pending",...}
 
 # 查询：status 变为 awaiting_approval 时带了 approval_requests（节点、产物、验收标准）
-curl -s localhost:8000/tasks/<task_id>
+curl -s localhost:8000/tasks/<task_id> -H "Authorization: Bearer $API_KEY"
 
 # 批准 / 驳回 / 改写（改写需提供替换后的节点产物）
-curl -s -X POST localhost:8000/tasks/<task_id>/approval      -H "Content-Type: application/json"      -d '{"decision":"approved","comment":"同意"}'
+# 审批只有 admin 能做；operator/viewer 会收到 403
+curl -s -X POST localhost:8000/tasks/<task_id>/approval \
+  -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
+  -d '{"decision":"approved","comment":"同意"}'
 # decision: rejected → 任务终态 rejected；rewritten → 需带 outputs
 ```
+
+## 安全基线（W9）
+
+1. **API Key + 三角色**（`src/multiagent/security/auth.py`）：`API_KEYS=key:role,...`，
+   `admin` = 读取/提交/审批，`operator` = 读取/提交，`viewer` = 只读。
+   `API_AUTH_ENABLED=true` 但未配置任何 Key 时**服务拒绝启动**（fail closed）。
+   `/health` 是公开探活端点。
+2. **输入过滤**：6 类 Prompt Injection 规则 + 敏感词；NFKC、零宽字符、汉字间空格归一化。
+   命中返回 `400 {"detail":{"code":"INPUT_BLOCKED",...}}`，不建任务、不调模型；
+   输入中的身份证/手机号/银行卡/密钥会先脱敏再送模型。
+3. **输出 DLP**：身份证 / 手机号 / 银行卡（Luhn 校验）/ 密钥与令牌正则脱敏，
+   覆盖 API 结果、SSE、CLI 与长期记忆；422 校验错误不回显原始输入。
+4. **SSE 的例外**：浏览器 `EventSource` 不能自定义 Header，因此只有
+   `/tasks/{id}/events` 允许 `?api_key=`；Key 可能进入访问日志，生产应置于 HTTPS 反代后。
+5. **未做**：限流、CORS、TLS/Vault、OIDC/RBAC+ABAC、外部检索内容隔离标注、
+   财务数字与模型层 DLP、审计日志持久化、Key 轮换——均在《实施路线图》§3.14 记录。
+
+代码里的 `API_AUTH_ENABLED` 默认 `false`（兼容本地 stub 与单测）；`.env.example`
+默认 `true` 并放占位 Key。**共享或对外环境必须开启鉴权。**
 
 > 已有数据卷的环境**不会**自动执行新增的初始化 SQL（initdb 只在空卷跑一次）。
 > 新增脚本需手工执行，例如长期记忆表：
