@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -80,7 +81,9 @@ def main() -> int:
         print(f"FAIL task status={detail.get('status')} error={detail.get('error')}")
         return 1
     result = json.dumps(detail.get("result") or {}, ensure_ascii=False)
-    if "2335000" not in result:
+    # 模型可能输出 2,335,000.0 / 2335000：去逗号与空白后比对
+    compact = re.sub(r"[,\s]", "", result)
+    if "2335000" not in compact:
         print("FAIL result does not contain the expected 2,335,000 figure")
         return 1
     print(f"PASS task ok (tokens={detail.get('result', {}).get('total_tokens')})")
