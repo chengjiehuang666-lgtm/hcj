@@ -1,0 +1,14 @@
+# 构建上下文只保留运行所需内容，避免把 .venv / 数据 / 密钥打进镜像
+.git
+.venv
+.model_cache
+eval_results
+.pytest_cache
+__pycache__
+*.pyc
+*.log
+.env
+.env.*
+!.env.example
+tests
+.zcode

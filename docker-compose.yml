@@ -1,11 +1,9 @@
 name: multiagent
 
 # 说明：本文件只起 PostgreSQL(pgvector) 与 Redis 两个依赖服务。
-# 应用自身在开发阶段直接跑在宿主机（uvicorn --reload），便于热重载与调试；
-# 容器化应用镜像留到阶段三（W12 部署脚本）再做。
+# 应用容器见 docker-compose.app.yml（W12 单机部署）；开发阶段应用可直接跑在宿主机。
 #
-# 注意：本机当前未安装 Docker（见 README「环境前置条件」），
-# 需先在 WSL2 Ubuntu 内安装 Docker Engine，或安装 Docker Desktop，方可使用本文件。
+# 依赖：Docker Desktop / Docker Engine（本机已安装并验证）。
 
 services:
   postgres:

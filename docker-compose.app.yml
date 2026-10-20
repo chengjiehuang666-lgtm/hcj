@@ -1,0 +1,50 @@
+# W12 单机部署 overlay：在 docker-compose.yml（PG/Redis）之上加应用服务。
+#
+# 用法：
+#   docker compose -f docker-compose.yml -f docker-compose.app.yml up -d --build
+#   APP_IMAGE=multiagent-app:<tag> docker compose ... up -d --no-build app
+#
+# 说明：
+# - 容器内访问宿主机模型端点必须用 host.docker.internal（Windows/macOS Docker Desktop）；
+#   Linux 服务器需改成宿主机 IP 或加 extra_hosts。
+# - Python 沙箱在容器内没有 Docker socket，降级为 subprocess（隔离更弱，如实标注）。
+# - embedding 模型缓存挂载宿主机 .model_cache，避免镜像膨胀与重复下载。
+services:
+  app:
+    image: ${APP_IMAGE:-multiagent-app:local}
+    build:
+      context: .
+      dockerfile: docker/app/Dockerfile
+    container_name: ma-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DSN: postgresql://multiagent:multiagent@postgres:5432/multiagent
+      POSTGRES_RO_DSN: postgresql://analyst_ro:analyst_ro@postgres:5432/multiagent
+      REDIS_URL: redis://redis:6379/0
+      LLM_PRIMARY_BASE_URL: http://host.docker.internal:7863/v1
+      LLM_FALLBACK_BASE_URL: http://host.docker.internal:7863/v1
+      LLM_FAST_PRIMARY_BASE_URL: http://host.docker.internal:7863/v1
+      LLM_FAST_FALLBACK_BASE_URL: http://host.docker.internal:7863/v1
+      EMBEDDING_CACHE_DIR: /app/.model_cache
+      PYTHON_SANDBOX_MODE: subprocess
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./.model_cache:/app/.model_cache:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s

@@ -101,3 +101,6 @@ eval_results/
 
 # ===== 本地模型缓存（embedding 等），体积大且可重新下载 =====
 .model_cache/
+
+# ===== 部署状态（W12：最近一次成功部署的镜像标签）=====
+.deploy-state
