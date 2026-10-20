@@ -1,6 +1,6 @@
 # 多 Agent 接入协作项目
 
-企业级多 Agent 智能协作平台。**阶段三进行中（W11 压测校准完成：D1/D2/D3 已定，全量 50/50）**（单人全职开发，计划与范围见《实施路线图》）。
+企业级多 Agent 智能协作平台。**阶段三收口（W12 完成：单机部署 + 冒烟 + 回滚，M3 达成）**（单人全职开发，计划与范围见《实施路线图》）。
 
 ## 唯一事实源
 
@@ -40,7 +40,11 @@
 │   └── cli.py                 # 命令行入口
 ├── tests/                     # 契约一致性、引擎、Agent、记忆、网关等单测
 ├── docker/initdb/             # PG 初始化 SQL（扩展 / 演示数据 / 知识库 / 记忆）
+├── docker/app/Dockerfile      # W12 应用镜像
 ├── docker-compose.yml         # PostgreSQL(pgvector) + Redis
+├── docker-compose.app.yml     # W12 应用服务 overlay
+├── scripts/                   # deploy.sh / rollback.sh / smoke.py
+├── 运维说明.md                # W12 部署与回滚手册
 ├── .env.example               # 环境变量模板（真实密钥放 .env，不入库）
 └── pyproject.toml
 ```
@@ -127,6 +131,20 @@ python -m multiagent.eval.loadtest --mode model --levels 12,16,20 --tasks-per-le
                                                   # 模型端点并发膝点（tasks 必须 ≥ 档位）
 python -m multiagent.memory --stats               # 长期记忆维护（--search / --clear）
 ```
+
+## 单机部署（W12）
+
+```bash
+cp .env.example .env           # 填 API_KEYS 与模型 Key
+mkdir -p .model_cache          # embedding 缓存（容器只读挂载）
+bash scripts/deploy.sh         # 构建 app + PG/Redis，健康检查 + 冒烟
+bash scripts/rollback.sh v0.14-w11-calibration   # 按 Git 标签回滚并冒烟
+```
+
+- 应用容器通过 `host.docker.internal:7863` 访问宿主机模型端点；Linux 需改地址。
+- 容器内无 Docker socket，Python 沙箱降级为 subprocess（结果里标注 isolation）。
+- 完整步骤、日志、指标、备份与常见问题见 [运维说明.md](运维说明.md)。
+- 回滚演练记录：部署 → 回滚到 `v0.14-w11-calibration` → 恢复，三次冒烟均通过。
 
 ### HITL 审批（W7）
 
