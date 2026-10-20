@@ -56,10 +56,11 @@ class KnowledgeStore:
 
     # ------------------------------------------------------------------ 写入
 
-    def ingest(self, documents: Iterable[Document]) -> dict[str, int]:
-        """分块、向量化并写入。同 (doc_id, chunk_index) 重复灌库为覆盖更新。"""
-        import psycopg
+    def ingest(self, documents: Iterable[Document], *, replace: bool = False) -> dict[str, int]:
+        """分块、向量化并写入。同 (doc_id, chunk_index) 重复灌库为覆盖更新。
 
+        `replace=True` 时先删掉这些 doc_id 的旧分块，避免文档变短后留下陈旧块。
+        """
         chunks: list[Chunk] = []
         for doc in documents:
             chunks.extend(
@@ -71,6 +72,23 @@ class KnowledgeStore:
                     overlap=self._settings.rag_chunk_overlap,
                 )
             )
+        return self.ingest_chunks(chunks, replace=replace)
+
+    def ingest_chunks(
+        self,
+        chunks: Iterable[Chunk],
+        *,
+        replace: bool = False,
+        purge_prefix: str | None = None,
+    ) -> dict[str, int]:
+        """写入已分好的块（Markdown 标题感知分片走这里）。
+
+        向量在开事务前生成；`purge_prefix` 在事务内先清空该前缀再插入，
+        向量失败不会动旧数据。
+        """
+        import psycopg
+
+        chunks = list(chunks)
         if not chunks:
             return {"documents": 0, "chunks": 0}
 
@@ -95,15 +113,40 @@ class KnowledgeStore:
                    embedding = EXCLUDED.embedding,
                    created_at = now()
         """
+        doc_ids = sorted({c.doc_id for c in chunks})
         try:
             with psycopg.connect(self._settings.postgres_dsn) as conn:
                 with conn.cursor() as cur:
+                    if purge_prefix:
+                        cur.execute(
+                            "DELETE FROM knowledge_chunks WHERE doc_id LIKE %s",
+                            (purge_prefix + "%",),
+                        )
+                    elif replace:
+                        cur.execute(
+                            "DELETE FROM knowledge_chunks WHERE doc_id = ANY(%s)",
+                            (doc_ids,),
+                        )
                     cur.executemany(sql, rows)
         except Exception as exc:
             raise KnowledgeStoreError(f"写入知识库失败: {exc}") from exc
 
-        doc_count = len({c.doc_id for c in chunks})
-        return {"documents": doc_count, "chunks": len(chunks)}
+        return {"documents": len(doc_ids), "chunks": len(chunks)}
+
+    def delete_prefix(self, prefix: str) -> int:
+        """删除某前缀下的全部分块（用于全量重灌时清理已删除的文档）。"""
+        import psycopg
+
+        try:
+            with psycopg.connect(self._settings.postgres_dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM knowledge_chunks WHERE doc_id LIKE %s",
+                        (prefix + "%",),
+                    )
+                    return int(cur.rowcount or 0)
+        except Exception as exc:
+            raise KnowledgeStoreError(f"清理知识库失败: {exc}") from exc
 
     # ------------------------------------------------------------------ 检索
 
