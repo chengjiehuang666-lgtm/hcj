@@ -1,6 +1,6 @@
 # 多 Agent 接入协作项目
 
-企业级多 Agent 智能协作平台。**阶段三收口（W12 完成：单机部署 + 冒烟 + 回滚，M3 达成）**（单人全职开发，计划与范围见《实施路线图》）。
+企业级多 Agent 智能协作平台。**W1–W12 已完成、M1/M2/M3 达成；W13 增补轻量控制台**（单人全职开发，计划与范围见《实施路线图》）。
 
 ## 唯一事实源
 
@@ -37,6 +37,7 @@
 │   ├── eval/                  # 评测集与执行器（50 条用例）+ 三层压测工具
 │   ├── security/              # W9：输入过滤、输出 DLP、API Key 角色权限
 │   ├── api/                   # REST + SSE 入口
+│   │   └── console/           # W13：轻量控制台（无构建链单页）
 │   └── cli.py                 # 命令行入口
 ├── tests/                     # 契约一致性、引擎、Agent、记忆、网关等单测
 ├── docker/initdb/             # PG 初始化 SQL（扩展 / 演示数据 / 知识库 / 记忆）
@@ -194,6 +195,19 @@ curl -s -X POST localhost:8000/tasks/<task_id>/approval \
 > 已有数据卷的环境**不会**自动执行新增的初始化 SQL（initdb 只在空卷跑一次）。
 > 新增脚本需手工执行，例如长期记忆表：
 > `docker exec -i ma-postgres psql -U multiagent -d multiagent < docker/initdb/04-memory-schema.sql`
+
+## 轻量控制台（W13）
+
+服务启动后打开 **http://localhost:8000/console/**：
+
+- 填写 API Key（保存在浏览器 `sessionStorage`，不落服务端）；
+- 提交任务、任务列表、SSE 实时进度、结论/关键发现/文档、评审；
+- **DAG 可视化**（节点按依赖分层，状态着色）、节点耗时与 Token；
+- Token/成本指标（总览 + 按 Agent + 按调用点）；
+- 待审批任务可直接批准/驳回（只有 admin Key 能成功）。
+
+无前端构建链（原生 HTML/CSS/JS），静态文件在 `src/multiagent/api/console/`。
+完整 React + React Flow 版本仍延后到扩员后。
 
 ## 可观测（W10）
 
