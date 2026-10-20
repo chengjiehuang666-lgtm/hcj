@@ -133,6 +133,23 @@ class Settings(BaseSettings):
     #: 记忆检索条数上限（混合加权与知识库同一套公式与权重）
     memory_top_k: int = 3
 
+    # ---- 安全基线（W9）----
+    #: 输入侧 Prompt Injection / 敏感词过滤（默认开启；规则误伤时可整体关闭）
+    security_enabled: bool = True
+    #: 输出侧 DLP 脱敏（身份证 / 手机号 / 银行卡 / 密钥）
+    security_dlp_enabled: bool = True
+    #: 敏感词列表（逗号分隔）。默认只收凭据/身份标识类词，避免误伤正常分析问题。
+    security_blocked_terms: str = (
+        "密码,口令,私钥,api key,apikey,secret key,access token,"
+        "身份证号,银行卡号,信用卡号,cvv"
+    )
+    #: 是否启用 API Key 鉴权。代码默认关闭以兼容本地 stub / 单测；
+    #: `.env.example` 默认开启——**共享或对外环境必须开启**。
+    api_auth_enabled: bool = False
+    #: `key:role,key:role`；角色 = admin | operator | viewer。
+    #: 启用鉴权但未配置任何 Key 时，API 启动会直接失败（fail closed）。
+    api_keys: str = ""
+
     # ---- 执行预算默认值（对应契约 TaskEvent.budget）----
     default_max_steps: int = 30
     # 任务级 Token 熔断阈值，即《实施路线图》待定项 D2。
@@ -204,6 +221,36 @@ class Settings(BaseSettings):
     def tier_for(self, route: str) -> str:
         """查询某个调用点走哪个档位（与 ModelRouter.tier_for 的判定保持一致）。"""
         return self.llm_routing.get(route, self.llm_default_tier)
+
+    @property
+    def blocked_terms(self) -> tuple[str, ...]:
+        """敏感词列表（逗号分隔 → 元组）。"""
+        return tuple(
+            term.strip() for term in self.security_blocked_terms.split(",") if term.strip()
+        )
+
+    @property
+    def api_key_map(self) -> dict[str, str]:
+        """解析后的 {API Key: 角色}；格式错误时抛 ValueError。"""
+        from .security.auth import parse_api_keys
+
+        return parse_api_keys(self.api_keys)
+
+    @property
+    def default_client_key(self) -> str | None:
+        """第一个可用客户端 Key（优先 operator，其次 admin/viewer）。
+
+        给压测/脚本用，不用于对外暴露。未配置或格式错误时返回 None。
+        """
+        try:
+            keys = self.api_key_map
+        except ValueError:
+            return None
+        for role in ("operator", "admin", "viewer"):
+            for key, value in keys.items():
+                if value == role:
+                    return key
+        return None
 
 
 @lru_cache(maxsize=1)

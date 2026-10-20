@@ -16,6 +16,7 @@ from typing import Any
 
 from ..config import Settings
 from ..rag.embeddings import LocalEmbedder, get_shared_embedder, to_pgvector_literal
+from ..security.dlp import redact_entry
 
 
 class MemoryStoreError(Exception):
@@ -162,6 +163,9 @@ class MemoryStore:
         entry = distill_memory(outcome)
         if entry is None:
             return None
+        # 输出侧 DLP：记忆是长期存档，绝不能把身份证/手机号/密钥写进库
+        if self._settings.security_dlp_enabled:
+            entry = redact_entry(entry)
         return self.sink(entry)
 
     # ------------------------------------------------------------------ 检索

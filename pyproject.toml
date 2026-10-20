@@ -48,3 +48,7 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# FastAPI 的依赖注入惯用法就是 Depends(...) 作为参数默认值
+"src/multiagent/api/app.py" = ["B008"]

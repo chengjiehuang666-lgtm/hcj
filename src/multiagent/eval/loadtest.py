@@ -267,11 +267,17 @@ async def _run_pipeline_level(
 
 
 async def _run_api_level(
-    base_url: str, questions: list[str], concurrency: int, per_task: int, timeout: float
+    base_url: str,
+    questions: list[str],
+    concurrency: int,
+    per_task: int,
+    timeout: float,
+    api_key: str | None = None,
 ) -> LevelResult:
     """HTTP 提交 + 轮询到终态（需要先启动 python -m multiagent.api）。"""
     import httpx
 
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     result = LevelResult(concurrency=concurrency, mode="api")
     sem = asyncio.Semaphore(concurrency)
 
@@ -283,12 +289,16 @@ async def _run_api_level(
                 started = time.perf_counter()
                 try:
                     response = await client.post(
-                        f"{base_url}/tasks", json={"question": question}
+                        f"{base_url}/tasks", json={"question": question}, headers=headers
                     )
                     response.raise_for_status()
                     task_id = response.json()["task_id"]
                     while True:
-                        body = (await client.get(f"{base_url}/tasks/{task_id}")).json()
+                        body = (
+                            await client.get(
+                                f"{base_url}/tasks/{task_id}", headers=headers
+                            )
+                        ).json()
                         if body["status"] in ("ok", "failed", "rejected"):
                             break
                         if time.perf_counter() - started > timeout:
@@ -390,6 +400,7 @@ async def main_async(args) -> int:
         )
     else:
         extra["note"] = f"HTTP 全链路（服务 {args.base_url}），真实模型，轮询到终态"
+        extra["auth"] = "enabled" if settings.api_auth_enabled else "disabled"
         questions = [
             "华东区 2026 年 9 月的销售额是多少？",
             "9 月华东区线上渠道和门店渠道各卖了多少？",
@@ -415,7 +426,15 @@ async def main_async(args) -> int:
             )
         else:
             result = await _run_api_level(
-                args.base_url, extra["questions"], level, args.tasks_per_level, args.timeout
+                args.base_url,
+                extra["questions"],
+                level,
+                args.tasks_per_level,
+                args.timeout,
+                api_key=(
+                    args.api_key
+                    or (settings.default_client_key if settings.api_auth_enabled else None)
+                ),
             )
         results.append(result)
         print(
@@ -494,6 +513,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tasks-per-level", type=int, default=3)
     parser.add_argument("--delay", type=float, default=1.0, help="假 Agent 每节点延迟（秒）")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="api 模式的 API Key；缺省取 .env 中的第一个 operator/admin/viewer Key",
+    )
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--out", default="eval_results")
     args = parser.parse_args(argv)

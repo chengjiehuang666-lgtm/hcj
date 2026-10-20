@@ -11,8 +11,8 @@ IM / Webhook / Web 控制台延后（见《实施路线图》W3 范围收敛）�
 - **健康检查分项报告**：数据库、Redis、模型网关分别探测。整体 ok/fail 会掩盖
   「到底哪一项挂了」，排障时需要分项。
 
-未做（如实记录）：鉴权、限流、CORS、任务状态持久化。前者属阶段三安全加固，
-后者属 W7。
+未做（如实记录）：限流、CORS、任务状态持久化。鉴权与输入/输出安全基线见 W9
+（API Key + admin/operator/viewer 三角色、输入过滤、输出 DLP 脱敏）。
 """
 
 from __future__ import annotations
@@ -20,15 +20,26 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from typing import Any, Literal, Awaitable, Callable
+from collections.abc import Callable
+from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..config import Settings
 from ..graph import AnalysisPipeline
 from ..graph.pipeline import PipelineOutcome, new_task_event
+from ..security import (
+    PERMISSIONS,
+    Principal,
+    authenticate,
+    parse_api_keys,
+    redact_structure,
+    redact_text,
+    scan_input,
+)
 from .tasks import TERMINAL_STATUSES, TaskRecord, TaskRegistry, _now_iso
 
 #: 流水线工厂签名：(settings, on_event) -> 具备 run(task_event) 的对象。
@@ -61,7 +72,7 @@ def _default_pipeline_factory(settings: Settings, on_event) -> AnalysisPipeline:
     return AnalysisPipeline(settings, on_event=on_event)
 
 
-def _outcome_to_result(outcome: PipelineOutcome) -> dict[str, Any]:
+def _outcome_to_result(outcome: PipelineOutcome, *, dlp: bool = True) -> dict[str, Any]:
     # 按 agent_role 取值：动态 DAG 下 node_id 可变，写死 "analyst_1" 会取不到
     outputs = outcome.merged_outputs_for_role("analyst")
     result: dict[str, Any] = {
@@ -114,7 +125,8 @@ def _outcome_to_result(outcome: PipelineOutcome) -> dict[str, Any]:
             "markdown": document.get("document_markdown"),
             "material_gaps": document.get("material_gaps", []),
         }
-    return result
+    # 输出侧 DLP：只处理用户可见边界，内部 node_results 保持原值供执行/评测
+    return redact_structure(result) if dlp else result
 
 
 async def _probe_dependencies(settings: Settings) -> dict[str, Any]:
@@ -170,6 +182,52 @@ def create_app(
     #: 后台任务必须保存强引用：fire-and-forget 的 Task 存在被 GC 回收的风险
     background_tasks: set = set()
 
+    # ---- 鉴权（W9）：启用时 fail closed -------------------------------------
+    auth_enabled = bool(app_settings.api_auth_enabled)
+    key_map: dict[str, str] = {}
+    if auth_enabled:
+        try:
+            key_map = parse_api_keys(app_settings.api_keys)
+        except ValueError as exc:
+            raise RuntimeError(f"API_KEYS 配置无效：{exc}") from exc
+        if not key_map:
+            raise RuntimeError(
+                "API_AUTH_ENABLED=true 但 API_KEYS 为空——拒绝启动（fail closed）"
+            )
+
+    def require(permission: str):
+        """FastAPI 依赖：校验 Bearer Key 与角色权限。"""
+
+        async def dependency(request: Request) -> Principal:
+            if not auth_enabled:
+                return Principal(key_id="anonymous", role="admin")
+            token = _bearer_token(request)
+            # SSE 的 EventSource 不能自定义 Header；只对该端点允许 query 传递。
+            # 代价是 Key 可能进入访问日志——本地单租户基线的明确取舍。
+            if token is None and request.url.path.endswith("/events"):
+                token = request.query_params.get("api_key")
+            if not token:
+                raise HTTPException(
+                    status_code=401,
+                    detail="缺少 API Key（Authorization: Bearer <key>）",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            principal = authenticate(token, key_map)
+            if principal is None:
+                raise HTTPException(
+                    status_code=401,
+                    detail="API Key 无效",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            if permission not in PERMISSIONS.get(principal.role, frozenset()):
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"角色 {principal.role} 无权执行 {permission}",
+                )
+            return principal
+
+        return dependency
+
     def _spawn(coro) -> None:
         task = asyncio.create_task(coro)
         background_tasks.add(task)
@@ -177,13 +235,31 @@ def create_app(
 
     app = FastAPI(
         title="多 Agent 智能协作平台（MVP 入口）",
-        version="0.1.0",
-        description="REST 提交分析任务 + SSE 订阅执行进度。",
+        version="0.2.0",
+        description="REST 提交分析任务 + SSE 订阅执行进度（W9：API Key + 输入/输出安全基线）。",
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error_handler(request: Request, exc: RequestValidationError):
+        """校验错误不回显原始输入。
+
+        FastAPI 默认的 422 会带 `input` 字段——超长/畸形请求里可能含手机号、
+        身份证等原文；安全基线要求错误响应也不泄露。
+        """
+        errors = [
+            {k: v for k, v in item.items() if k not in ("input", "ctx", "url")}
+            for item in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": errors})
 
     async def _execute(record: TaskRecord, *, resume_value: dict[str, Any] | None = None) -> None:
         async def on_event(name: str, payload: dict[str, Any]) -> None:
-            record.publish(name, **payload)
+            safe = (
+                redact_structure(payload)
+                if app_settings.security_dlp_enabled
+                else payload
+            )
+            record.publish(name, **safe)
             registry.trim(record)
 
         try:
@@ -199,25 +275,41 @@ def create_app(
                 resume=resume_value is not None,
                 resume_value=resume_value,
             )
+            result = _outcome_to_result(
+                outcome, dlp=app_settings.security_dlp_enabled
+            )
             if outcome.status == "awaiting_approval":
                 # HITL 暂停：非终态。不发 task_finished，SSE 流保持打开等审批。
                 record.status = "awaiting_approval"
-                record.approval_requests = outcome.approval_requests
-                record.result = _outcome_to_result(outcome)
+                record.approval_requests = (
+                    redact_structure(outcome.approval_requests)
+                    if app_settings.security_dlp_enabled
+                    else outcome.approval_requests
+                )
+                record.result = result
                 record.publish(
                     "approval_required",
-                    requests=outcome.approval_requests,
+                    requests=record.approval_requests,
                 )
                 return
-            record.result = _outcome_to_result(outcome)
+            record.result = result
             # ok / rejected 原样传递；failed 也保持 failed
             record.status = outcome.status
             record.approval_requests = []
             if outcome.status != "ok":
-                record.error = outcome.error
+                record.error = (
+                    redact_text(outcome.error or "")[0]
+                    if app_settings.security_dlp_enabled
+                    else outcome.error
+                )
         except Exception as exc:  # 兜底：任务异常不得让服务崩掉
             record.status = "failed"
-            record.error = f"{type(exc).__name__}: {exc}"[:500]
+            error = f"{type(exc).__name__}: {exc}"[:500]
+            record.error = (
+                redact_text(error)[0]
+                if app_settings.security_dlp_enabled
+                else error
+            )
         finally:
             if record.status in TERMINAL_STATUSES:
                 record.finished_at = _now_iso()
@@ -241,13 +333,32 @@ def create_app(
         }
 
     @app.post("/tasks", response_model=SubmitResponse, status_code=202)
-    async def submit(request: SubmitRequest) -> SubmitResponse:
+    async def submit(
+        request: SubmitRequest,
+        _principal: Principal = Depends(require("tasks:submit")),
+    ) -> SubmitResponse:
+        # 输入侧安全过滤（W9）：命中注入/敏感词直接 400，不建任务、不调模型。
+        verdict = scan_input(
+            request.question,
+            blocked_terms=app_settings.blocked_terms,
+            enabled=app_settings.security_enabled,
+        )
+        if not verdict.allowed:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "INPUT_BLOCKED",
+                    "reason": verdict.blocked_reason,
+                    "rule": verdict.rule,
+                },
+            )
+        question = verdict.text
         task_id = str(uuid.uuid4())
-        record = registry.create(task_id, request.question)
+        record = registry.create(task_id, question)
         # TaskEvent 只创建一次：task_id 同时是 checkpointer 的 thread_id，
         # HITL 恢复/续跑必须能找回来（此前每次 run 都新生成 UUID，恢复无从下手）。
         record.task_event = new_task_event(
-            request.question, settings=app_settings, task_id=task_id
+            question, settings=app_settings, task_id=task_id
         )
         # 后台执行，不阻塞提交响应——这是 SSE 能实时推送的前提
         _spawn(_execute(record))
@@ -275,7 +386,11 @@ def create_app(
         return record
 
     @app.post("/tasks/{task_id}/approval", status_code=202)
-    async def submit_approval(task_id: str, body: ApprovalBody) -> dict[str, Any]:
+    async def submit_approval(
+        task_id: str,
+        body: ApprovalBody,
+        principal: Principal = Depends(require("tasks:approve")),
+    ) -> dict[str, Any]:
         """HITL 后端阻塞点：批准 / 驳回 / 改写，然后从暂停处恢复执行。"""
         record = registry.get(task_id)
         if record is None:
@@ -293,11 +408,13 @@ def create_app(
                 status_code=422, detail="rewritten 决策必须提供 outputs（替换后的节点产物）"
             )
         record.status = "running"
+        # 审计：启用鉴权时审批人取 Key 指纹，调用方无法自称 approver
+        approver = principal.key_id if auth_enabled else body.approver
         record.publish(
             "approval_received",
             decision=body.decision,
-            comment=body.comment,
-            approver=body.approver,
+            comment=redact_text(body.comment)[0] if app_settings.security_dlp_enabled else body.comment,
+            approver=approver,
         )
         resume_value = {
             "decision": body.decision,
@@ -308,18 +425,29 @@ def create_app(
         return {"task_id": task_id, "status": "running"}
 
     @app.get("/tasks")
-    async def list_tasks(limit: int = 20) -> dict[str, Any]:
-        return {"tasks": registry.list_recent(limit=limit)}
+    async def list_tasks(
+        limit: int = 20,
+        _principal: Principal = Depends(require("tasks:read")),
+    ) -> dict[str, Any]:
+        body = {"tasks": registry.list_recent(limit=limit)}
+        return redact_structure(body) if app_settings.security_dlp_enabled else body
 
     @app.get("/tasks/{task_id}")
-    async def get_task(task_id: str) -> dict[str, Any]:
+    async def get_task(
+        task_id: str,
+        _principal: Principal = Depends(require("tasks:read")),
+    ) -> dict[str, Any]:
         record = registry.get(task_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
-        return record.summary()
+        body = record.summary()
+        return redact_structure(body) if app_settings.security_dlp_enabled else body
 
     @app.get("/tasks/{task_id}/events")
-    async def stream_events(task_id: str) -> StreamingResponse:
+    async def stream_events(
+        task_id: str,
+        _principal: Principal = Depends(require("tasks:read")),
+    ) -> StreamingResponse:
         record = registry.get(task_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
@@ -338,7 +466,7 @@ def create_app(
             try:
                 while True:
                     item = await queue.get()
-                    yield _sse(item)
+                    yield _sse(item, dlp=app_settings.security_dlp_enabled)
                     if item.get("event") in ("task_finished", "end"):
                         return
             finally:
@@ -354,7 +482,16 @@ def create_app(
     return app
 
 
-def _sse(payload: dict[str, Any]) -> str:
+def _bearer_token(request: Request) -> str | None:
+    header = request.headers.get("authorization", "")
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    return token.strip()
+
+
+def _sse(payload: dict[str, Any], *, dlp: bool = True) -> str:
     """按 SSE 格式编码一条事件。"""
-    name = payload.get("event", "message")
-    return f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    body = redact_structure(payload) if dlp else payload
+    name = body.get("event", "message")
+    return f"event: {name}\ndata: {json.dumps(body, ensure_ascii=False)}\n\n"

@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field
 from ..agents import AgentContext, BaseAgent, build_agent_registry
 from ..config import Settings, get_settings
 from ..memory import MemoryStore
+from ..security import scan_input
 from ..contracts import (
     AgentInvocation,
     AgentResult,
@@ -872,6 +873,37 @@ class AnalysisPipeline:
 
         started = time.perf_counter()
         task_id = str(event.task_id)
+        # 输入侧安全兜底（W9）：API 提交前已拦一次；CLI/评测/直调也必须拦，
+        # 否则安全基线只在 REST 入口生效。命中时不建图、不连库、不调模型。
+        if self.settings.security_enabled:
+            verdict = scan_input(
+                event.payload.text,
+                blocked_terms=self.settings.blocked_terms,
+                enabled=True,
+            )
+            if not verdict.allowed:
+                await self._emit(
+                    "input_blocked",
+                    task_id=task_id,
+                    rule=verdict.rule,
+                    reason=verdict.blocked_reason,
+                )
+                return PipelineOutcome(
+                    task_id=task_id,
+                    status="failed",
+                    error=f"[INPUT_BLOCKED] {verdict.blocked_reason}",
+                    error_code="INPUT_BLOCKED",
+                    retryable=False,
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                )
+            if verdict.redactions:
+                event = event.model_copy(
+                    update={
+                        "payload": event.payload.model_copy(
+                            update={"text": verdict.text}
+                        )
+                    }
+                )
         # 用路由器而非单条主备链：按调用点分派到不同档位（分级路由）
         router = build_router_from_settings(self.settings)
         registry = build_agent_registry()

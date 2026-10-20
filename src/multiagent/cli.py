@@ -8,13 +8,30 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import replace
 
 from .asyncutil import run_async
 from .config import Settings
 from .graph import AnalysisPipeline
 from .graph.pipeline import new_task_event
+from .security.dlp import redact_structure, redact_text
 
 DEFAULT_QUESTION = "分析上月华东区销售额下滑的原因"
+
+
+def _redacted_outcome(outcome):
+    """CLI 是用户可见边界：打印前统一做 DLP 脱敏（内部状态不动）。"""
+    return replace(
+        outcome,
+        summary=redact_text(outcome.summary or "")[0],
+        error=redact_text(outcome.error)[0] if outcome.error else None,
+        node_results=redact_structure(outcome.node_results),
+        node_outputs=redact_structure(outcome.node_outputs),
+        blackboard=redact_structure(outcome.blackboard),
+        dag=redact_structure(outcome.dag),
+        approval_requests=redact_structure(outcome.approval_requests),
+        approvals=redact_structure(outcome.approvals),
+    )
 
 
 def _print_outcome(outcome) -> int:
@@ -117,11 +134,13 @@ def main(argv: list[str] | None = None) -> int:
 
     settings = Settings()
     event = new_task_event(args.question, settings=settings)
-    print(f"▶ 提交需求：{args.question}")
+    print(f"▶ 提交需求：{redact_text(args.question)[0]}")
     print(f"▶ 模型：{settings.primary.provider}/{settings.primary.model} "
           f"（备用 {settings.fallback.provider}/{settings.fallback.model}）\n")
 
     outcome = run_async(AnalysisPipeline(settings).run(event))
+    if settings.security_dlp_enabled:
+        outcome = _redacted_outcome(outcome)
     return _print_outcome(outcome)
 
 
