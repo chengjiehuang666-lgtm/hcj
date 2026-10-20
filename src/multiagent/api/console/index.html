@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>多 Agent 控制台</title>
+  <link rel="stylesheet" href="console.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">MA</span>
+      <div>
+        <h1>多 Agent 控制台</h1>
+        <p class="muted">任务 · 进度 · DAG · Token/成本 · 指标</p>
+      </div>
+    </div>
+    <div class="auth">
+      <label for="api-key">API Key</label>
+      <input id="api-key" type="password" autocomplete="off" placeholder="operator / admin key" />
+      <button id="save-key" class="btn">保存</button>
+      <span id="conn" class="dot off" title="未连接"></span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="panel sidebar">
+      <section class="block">
+        <h2>提交任务</h2>
+        <form id="submit-form">
+          <textarea id="question" rows="3" maxlength="2000"
+            placeholder="例如：分析上月华东区销售额下滑的原因"></textarea>
+          <div class="row">
+            <button type="submit" class="btn primary">提交</button>
+            <button type="button" id="refresh" class="btn">刷新列表</button>
+          </div>
+          <p id="submit-hint" class="hint"></p>
+        </form>
+      </section>
+
+      <section class="block grow">
+        <h2>任务列表 <span id="task-count" class="muted"></span></h2>
+        <ul id="task-list" class="task-list"></ul>
+      </section>
+    </aside>
+
+    <section class="panel detail">
+      <div class="detail-head">
+        <h2 id="detail-title">任务详情</h2>
+        <div id="approval-actions" class="hidden">
+          <button id="approve" class="btn ok">批准</button>
+          <button id="reject" class="btn danger">驳回</button>
+        </div>
+      </div>
+      <div id="detail-empty" class="empty">从左侧选择一个任务，或提交新任务。</div>
+
+      <div id="detail-body" class="hidden">
+        <div class="cards" id="summary-cards"></div>
+        <div class="two-col">
+          <div>
+            <h3>结论</h3>
+            <p id="summary" class="summary"></p>
+            <h3>关键发现</h3>
+            <ul id="findings" class="findings"></ul>
+            <div id="document-wrap" class="hidden">
+              <h3>文档</h3>
+              <pre id="document" class="document"></pre>
+            </div>
+            <div id="review-wrap" class="hidden">
+              <h3>评审</h3>
+              <p id="review"></p>
+              <ul id="review-issues" class="issues"></ul>
+            </div>
+          </div>
+          <div>
+            <h3>DAG</h3>
+            <div id="dag" class="dag"></div>
+            <h3>节点</h3>
+            <table class="table" id="nodes-table">
+              <thead><tr><th>节点</th><th>角色</th><th>状态</th><th>耗时</th><th>Token</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        <h3>事件流</h3>
+        <pre id="events" class="events"></pre>
+      </div>
+    </section>
+
+    <section class="panel metrics">
+      <h2>指标 <span id="metrics-unit" class="muted"></span></h2>
+      <div class="cards" id="metric-cards"></div>
+      <div class="two-col">
+        <div><h3>Token / Agent</h3><table class="table" id="agent-table"><tbody></tbody></table></div>
+        <div><h3>成本 / 调用点</h3><table class="table" id="route-table"><tbody></tbody></table></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="console.js"></script>
+</body>
+</html>

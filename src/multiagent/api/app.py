@@ -21,11 +21,13 @@ import asyncio
 import json
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from ..config import Settings
@@ -88,6 +90,8 @@ def _outcome_to_result(outcome: PipelineOutcome, *, dlp: bool = True) -> dict[st
         "total_tokens": outcome.total_tokens,
         "duration_ms": outcome.duration_ms,
         "tokens_by_route": outcome.tokens_by_route,
+        # W13：控制台用 DAG 结构做可视化（节点 + 依赖）
+        "dag": outcome.dag,
         # W10：成本计量（按调用点 / Agent；单位见配置 cost_unit，本地端点是积分）
         "cost": outcome.total_cost,
         "cost_by_route": outcome.cost_by_route,
@@ -503,6 +507,20 @@ def create_app(
         body = build_metrics(registry.all())
         body["cost_unit"] = app_settings.cost_unit
         return body
+
+    # W13 轻量控制台：无构建链的单页，复用上面的 REST / SSE / metrics。
+    # 页面本身公开（不含数据）；所有数据请求仍要 API Key，Key 只存浏览器 sessionStorage。
+    console_dir = Path(__file__).with_name("console")
+    if console_dir.is_dir():
+        app.mount(
+            "/console",
+            StaticFiles(directory=str(console_dir), html=True),
+            name="console",
+        )
+
+        @app.get("/", include_in_schema=False)
+        async def console_root() -> RedirectResponse:
+            return RedirectResponse(url="/console/")
 
     return app
 
