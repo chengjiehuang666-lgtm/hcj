@@ -121,6 +121,11 @@ docker compose up -d
 
 # 5. 灌知识库（首次或数据卷重建后）
 python -m multiagent.rag.ingest --stats
+# 示例语料（5 篇）
+python -m multiagent.rag.ingest
+# Obsidian 仓库批量灌库（Markdown 标题感知分片 + docx；默认排除项目记忆/Agent 指令）
+python -m multiagent.rag.vault_ingest --vault "G:/第二大脑obsidian仓库/obsidian仓库" --dry-run
+python -m multiagent.rag.vault_ingest --vault "G:/第二大脑obsidian仓库/obsidian仓库"
 
 # 6. 跑一条端到端任务 / 评测回归
 python -m multiagent.cli "分析上月华东区销售额下滑的原因"
