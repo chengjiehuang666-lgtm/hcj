@@ -594,7 +594,7 @@ def test_read_checkpoint_state_is_best_effort() -> None:
 
 
 def test_new_task_event_budget_comes_from_settings() -> None:
-    """任务预算从 Settings 派生（D2=60,000），而不是契约默认的 200,000。"""
+    """任务预算从 Settings 派生，而不是契约默认的 200,000。"""
     from datetime import datetime, timedelta, timezone
 
     from multiagent.config import Settings

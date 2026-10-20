@@ -1370,7 +1370,7 @@ def new_task_event(
 ) -> TaskEvent:
     """构造一个 REST 渠道的 TaskEvent，便于本地跑链路。
 
-    预算从 Settings 派生（`D2=60,000` 等），与契约默认的 200,000 区分开：
+    预算从 Settings 派生（`D2=80,000` 等），与契约默认的 200,000 区分开：
     契约里 200,000 是「未指定时的上限」，实际执行的熔断口径由 D2 决定。
     `task_id` 可用于**恢复**场景：API 层必须复用原始 id（= checkpointer 的
     thread_id），不能每次重新生成。

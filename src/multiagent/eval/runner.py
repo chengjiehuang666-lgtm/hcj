@@ -337,6 +337,82 @@ class EvalReport:
         return summary
 
 
+async def _execute_case(pipeline, settings: Settings, case: EvalCase) -> CaseResult:
+    """跑一条用例并打分；不写 report。
+
+    单独抽出来是为了让「记忆前置用例」在评审 verdict 波动导致未沉淀时
+    能重跑一次并替换结果——评分逻辑只保留一份。
+    """
+    event = new_task_event(case.question, settings=settings)
+    try:
+        outcome = await pipeline.run(event)
+        # HITL：评测没有人工审批，遇到合法暂停时**自动批准**（模拟审批人），
+        # 让「暂停→恢复」的完整链路也被评测覆盖，而不是把暂停判成失败。
+        # 循环处理多审批门（DAG 可能有多个 requires_human_approval 节点）；
+        # 每段都是独立的 run()，时延与调用点归因必须跨段合并。
+        segments = [outcome]
+        approvals_used = 0
+        while outcome.status == "awaiting_approval" and approvals_used < 3:
+            approvals_used += 1
+            outcome = await pipeline.run(
+                event,
+                resume=True,
+                resume_value={"decision": "approved", "comment": "评测自动批准"},
+            )
+            segments.append(outcome)
+        latency_ms = sum(int(seg.duration_ms or 0) for seg in segments)
+        route_tokens = _sum_route_tokens(segments)
+    except Exception as exc:  # 单条用例失败不应中断整轮评测
+        # 记录完整栈：只留一句异常消息会让间歇性崩溃无从排查
+        import traceback
+
+        return CaseResult(
+            case_id=case.id,
+            question=case.question,
+            passed=False,
+            status="crashed",
+            latency_ms=0,
+            tokens=0,
+            input_tokens=0,
+            output_tokens=0,
+            failed_checks=["exception"],
+            error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"[:3000],
+        )
+
+    passed, failed, forbidden, insufficient = grade(case, outcome)
+    outputs = _analyst_outputs(outcome)
+    docs = _retrieved_docs(outcome)
+    verdict, issue_count = _review_summary(outcome)
+    memories = _retrieved_memories(outcome)
+    return CaseResult(
+        case_id=case.id,
+        question=case.question,
+        scenario=case.scenario,
+        passed=passed,
+        status=outcome.status,
+        latency_ms=latency_ms,
+        tokens=outcome.total_tokens,
+        input_tokens=outcome.total_input_tokens,
+        output_tokens=outcome.total_output_tokens,
+        cost=outcome.total_cost,
+        failed_checks=failed,
+        hit_forbidden=forbidden,
+        insufficient_data=insufficient,
+        sql_rows=outputs.get("row_count"),
+        sql_hash=outputs.get("sql_hash"),
+        summary=(outcome.summary or "")[:200],
+        error=outcome.error,
+        route_tokens=route_tokens,
+        retrieved_docs=sorted(set(docs)),
+        knowledge_count=len(docs),
+        review_verdict=verdict,
+        review_issues=issue_count,
+        memory_count=len(memories),
+        memory_sunk=outcome.memory_sunk,
+        memory_error=outcome.memory_error,
+    )
+
+
 async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
     pipeline = AnalysisPipeline(settings)
     report = EvalReport(
@@ -348,93 +424,29 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
     )
 
     started = time.perf_counter()
+    #: 被记忆用例依赖的前置用例：评审 verdict 有随机性，未沉淀时允许重跑一次。
+    #: 仍要求「本次真的沉淀」——重跑不通过则记忆用例照常失败，牙齿不丢。
+    producer_ids = {c.memory_source_case for c in cases if c.memory_source_case}
     for index, case in enumerate(cases, start=1):
         print(f"[{index}/{len(cases)}] {case.id} … ", end="", flush=True)
-        event = new_task_event(case.question, settings=settings)
-        try:
-            outcome = await pipeline.run(event)
-            # HITL：评测没有人工审批，遇到合法暂停时**自动批准**（模拟审批人），
-            # 让「暂停→恢复」的完整链路也被评测覆盖，而不是把暂停判成失败。
-            # 循环处理多审批门（DAG 可能有多个 requires_human_approval 节点）；
-            # 每段都是独立的 run()，时延与调用点归因必须跨段合并。
-            segments = [outcome]
-            approvals_used = 0
-            while outcome.status == "awaiting_approval" and approvals_used < 3:
-                approvals_used += 1
-                outcome = await pipeline.run(
-                    event,
-                    resume=True,
-                    resume_value={"decision": "approved", "comment": "评测自动批准"},
-                )
-                segments.append(outcome)
-            latency_ms = sum(int(seg.duration_ms or 0) for seg in segments)
-            route_tokens = _sum_route_tokens(segments)
-        except Exception as exc:  # 单条用例失败不应中断整轮评测
-            # 记录完整栈：只留一句异常消息会让间歇性崩溃无从排查
-            import traceback
-
-            report.results.append(
-                CaseResult(
-                    case_id=case.id,
-                    question=case.question,
-                    passed=False,
-                    status="crashed",
-                    latency_ms=0,
-                    tokens=0,
-                    input_tokens=0,
-                    output_tokens=0,
-                    failed_checks=["exception"],
-                    error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"[:3000],
-                )
-            )
-            print("崩溃")
-            continue
-
-        passed, failed, forbidden, insufficient = grade(case, outcome)
+        result = await _execute_case(pipeline, settings, case)
+        if case.id in producer_ids and result.memory_sunk is None:
+            print("前置未沉淀→重跑一次 … ", end="", flush=True)
+            retried = await _execute_case(pipeline, settings, case)
+            if retried.memory_sunk is not None:
+                result = retried
         # 记忆用例：前置用例必须**真的沉淀**（沉淀结果在它的 CaseResult 上）
         if problem := _memory_source_problem(case, report.results):
-            failed.append(problem)
-            passed = False
-        outputs = _analyst_outputs(outcome)
-        docs = _retrieved_docs(outcome)
-        verdict, issue_count = _review_summary(outcome)
-        memories = _retrieved_memories(outcome)
-        report.results.append(
-            CaseResult(
-                case_id=case.id,
-                question=case.question,
-                scenario=case.scenario,
-                passed=passed,
-                status=outcome.status,
-                latency_ms=latency_ms,
-                tokens=outcome.total_tokens,
-                input_tokens=outcome.total_input_tokens,
-                output_tokens=outcome.total_output_tokens,
-                cost=outcome.total_cost,
-                failed_checks=failed,
-                hit_forbidden=forbidden,
-                insufficient_data=insufficient,
-                sql_rows=outputs.get("row_count"),
-                sql_hash=outputs.get("sql_hash"),
-                summary=(outcome.summary or "")[:200],
-                error=outcome.error,
-                route_tokens=route_tokens,
-                retrieved_docs=sorted(set(docs)),
-                knowledge_count=len(docs),
-                review_verdict=verdict,
-                review_issues=issue_count,
-                memory_count=len(memories),
-                memory_sunk=outcome.memory_sunk,
-                memory_error=outcome.memory_error,
-            )
-        )
-        if passed:
+            result.failed_checks.append(problem)
+            result.passed = False
+        report.results.append(result)
+        if result.passed:
             report.passed += 1
         print(
-            f"{'PASS' if passed else 'FAIL'} "
-            f"{latency_ms / 1000:.1f}s {outcome.total_tokens}tok"
-            + (f"  未命中={failed}" if failed else "")
-            + (f"  禁用词={forbidden}" if forbidden else "")
+            f"{'PASS' if result.passed else 'FAIL'} "
+            f"{result.latency_ms / 1000:.1f}s {result.tokens}tok"
+            + (f"  未命中={result.failed_checks}" if result.failed_checks else "")
+            + (f"  禁用词={result.hit_forbidden}" if result.hit_forbidden else "")
         )
 
     report.wall_time_s = time.perf_counter() - started

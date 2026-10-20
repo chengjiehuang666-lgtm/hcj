@@ -42,6 +42,8 @@ class Sample:
     error: str | None = None
     server_duration_ms: int | None = None
     tokens: int | None = None
+    #: W10 成本计量（端点积分，见 Settings.cost_unit）
+    cost: float | None = None
 
 
 @dataclass
@@ -86,6 +88,19 @@ class LevelResult:
     @property
     def throughput(self) -> float:
         return len(self.samples) / self.wall_s if self.wall_s else 0.0
+
+    @property
+    def total_cost(self) -> float:
+        return round(sum(s.cost or 0.0 for s in self.samples if s.ok), 6)
+
+    @property
+    def mean_cost(self) -> float:
+        values = [s.cost for s in self.samples if s.ok and s.cost is not None]
+        return sum(values) / len(values) if values else 0.0
+
+    @property
+    def total_tokens(self) -> int:
+        return sum(s.tokens or 0 for s in self.samples if s.ok)
 
 
 def _conn_count(settings) -> int:
@@ -312,6 +327,7 @@ async def _run_api_level(
                             error=body.get("error"),
                             server_duration_ms=detail.get("duration_ms"),
                             tokens=detail.get("total_tokens"),
+                            cost=detail.get("cost"),
                         )
                     )
                 except Exception as exc:  # noqa: BLE001
@@ -362,6 +378,19 @@ def render_report(results: list[LevelResult], *, mode: str, extra: dict[str, Any
             f"{level.percentile(99):.1f}s | {max_ms / 1000:.1f}s | "
             f"{level.peak_connections if level.peak_connections is not None else '-'} |"
         )
+    if any(s.cost is not None for level in results for s in level.samples):
+        lines += [
+            "",
+            "## 成本（端点积分，非货币）",
+            "",
+            "| 并发 | 成功任务 | 总 Token | 总成本 | 平均成本/任务 |",
+            "| --: | --: | --: | --: | --: |",
+        ]
+        for level in results:
+            lines.append(
+                f"| {level.concurrency} | {level.ok_count} | {level.total_tokens:,} | "
+                f"{level.total_cost:.4f} | {level.mean_cost:.4f} |"
+            )
     lines += ["", "## 失败样本", ""]
     errors = [
         (level.concurrency, sample.error)
@@ -495,6 +524,9 @@ async def main_async(args) -> int:
                 "p50_s": round(level.percentile(50), 3),
                 "p95_s": round(level.percentile(95), 3),
                 "p99_s": round(level.percentile(99), 3),
+                "total_tokens": level.total_tokens,
+                "total_cost": level.total_cost,
+                "mean_cost": round(level.mean_cost, 6),
                 "peak_connections": level.peak_connections,
                 "errors": [s.error for s in level.samples if not s.ok][:20],
             }

@@ -46,6 +46,36 @@ def test_percentile_excludes_failed_samples() -> None:
     assert level.ok_count == 6
 
 
+def test_cost_aggregation() -> None:
+    level = LevelResult(
+        concurrency=2,
+        mode="api",
+        samples=[
+            Sample(ok=True, latency_ms=1000, tokens=1000, cost=0.5),
+            Sample(ok=True, latency_ms=1000, tokens=3000, cost=1.5),
+            Sample(ok=False, latency_ms=0, error="HTTP 401", cost=None),
+        ],
+        wall_s=2.0,
+    )
+    assert level.total_tokens == 4000
+    assert level.total_cost == 2.0
+    assert level.mean_cost == 1.0
+
+
+def test_render_report_includes_cost_section() -> None:
+    level = LevelResult(
+        concurrency=2,
+        mode="api",
+        samples=[Sample(ok=True, latency_ms=1000, tokens=1000, cost=0.5)],
+        wall_s=1.0,
+    )
+    markdown = render_report(
+        [level], mode="api", extra={"model": "m", "base_url": "u", "note": "n"}
+    )
+    assert "## 成本（端点积分，非货币）" in markdown
+    assert "0.5000" in markdown
+
+
 def test_render_report_shows_effective_concurrency_and_marks_capped_level() -> None:
     results = [
         _level(4, [1000, 1200, 1500, 1800]),

@@ -171,7 +171,8 @@ class Settings(BaseSettings):
     # 定值规则：评测实测最大 × 1.5 安全系数、向上取整到万。
     #   W4（无 reviewer，20 条）：最大 20,550 → 40,000
     #   W6（含 reviewer，27 条）：最大 37,842 → 60,000（实测见路线图 §3.11）
-    default_max_tokens: int = 60_000
+    #   W11（50 条复跑）：最大 48,051 → 80,000（规则不变：最大 × 1.5、向上取整到万）
+    default_max_tokens: int = 80_000
     default_max_retries: int = 2
     default_task_timeout_seconds: int = 300
     #: 动态重规划次数上限（W7）。触发条件=节点重试耗尽或 Agent 返回 needs_replan；

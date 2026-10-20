@@ -354,6 +354,65 @@ def test_sum_route_tokens_merges_segments() -> None:
     assert merged["writer"]["total_tokens"] == 300
 
 
+def test_memory_producer_retries_once_when_not_sunk(monkeypatch) -> None:
+    """前置分析用例被评审判 fail 导致未沉淀时，重跑一次；牙齿仍是「本次真沉淀」。"""
+    import asyncio
+
+    from multiagent.config import Settings
+    from multiagent.eval import runner as runner_module
+    from multiagent.graph.pipeline import PipelineOutcome
+
+    class FlakyPipeline:
+        def __init__(self, settings):
+            self.producer_calls = 0
+
+        async def run(self, event, *, resume=False, resume_value=None):
+            if event.payload.text == "core":
+                self.producer_calls += 1
+                return PipelineOutcome(
+                    task_id=str(event.task_id),
+                    status="ok",
+                    summary="华东下滑",
+                    total_tokens=1,
+                    duration_ms=1,
+                    memory_sunk=100 if self.producer_calls >= 2 else None,
+                    node_results=[
+                        {"agent_role": "analyst", "status": "ok",
+                         "outputs": {"summary": "华东下滑", "sql_hash": "x"}},
+                    ],
+                )
+            return PipelineOutcome(
+                task_id=str(event.task_id),
+                status="ok",
+                summary="华东历史结论",
+                total_tokens=1,
+                duration_ms=1,
+                node_results=[
+                    {"agent_role": "reviewer", "status": "ok",
+                     "outputs": {"verdict": "pass", "issue_count": 0}},
+                    {"agent_role": "retriever", "status": "ok",
+                     "outputs": {"knowledge": [], "memories": [{"content": "华东历史结论"}]}},
+                ],
+            )
+
+    monkeypatch.setattr(runner_module, "AnalysisPipeline", FlakyPipeline)
+    producer = EvalCase(id="prod", question="core", expect_any=[])
+    consumer = EvalCase(
+        id="mem",
+        question="mem",
+        expect_any=[["华东"]],
+        expect_memories=["华东"],
+        memory_source_case="prod",
+    )
+    report = asyncio.run(
+        runner_module.run_cases(Settings(_env_file=None), [producer, consumer])
+    )
+    assert report.passed == 2
+    prod_result = next(r for r in report.results if r.case_id == "prod")
+    assert prod_result.memory_sunk == 100, "重跑后的沉淀结果应替换首次结果"
+    assert report.results[-1].passed is True
+
+
 def test_run_cases_auto_approves_multi_gate_and_merges_latency(monkeypatch) -> None:
     """多个审批门：自动批准循环（≤3 次），且时延按分段相加。"""
     import asyncio
