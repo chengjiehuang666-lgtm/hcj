@@ -1,6 +1,6 @@
 # 多 Agent 接入协作项目
 
-企业级多 Agent 智能协作平台。**阶段三进行中（W9 安全基线完成：输入过滤 + 输出 DLP + API Key 角色权限）**（单人全职开发，计划与范围见《实施路线图》）。
+企业级多 Agent 智能协作平台。**阶段三进行中（W10 可观测完成：结构化日志 + task_id 贯穿 + 成本计量）**（单人全职开发，计划与范围见《实施路线图》）。
 
 ## 唯一事实源
 
@@ -26,6 +26,7 @@
 │   └── 实施路线图.md
 ├── src/multiagent/            # 应用代码
 │   ├── config.py              # 配置（pydantic-settings，读 .env）
+│   ├── observability.py       # W10：结构化日志、task_id 贯穿、Token/成本计量
 │   ├── contracts/             # 契约的 Pydantic 实现，与接口契约一一对应
 │   ├── gateway/               # 大模型网关（供应商无关 + 降级 + 分级路由）
 │   ├── agents/                # 专家 Agent：planner / retriever / analyst / reviewer / writer
@@ -176,6 +177,21 @@ curl -s -X POST localhost:8000/tasks/<task_id>/approval \
 > 已有数据卷的环境**不会**自动执行新增的初始化 SQL（initdb 只在空卷跑一次）。
 > 新增脚本需手工执行，例如长期记忆表：
 > `docker exec -i ma-postgres psql -U multiagent -d multiagent < docker/initdb/04-memory-schema.sql`
+
+## 可观测（W10）
+
+- **结构化日志**：`multiagent` 命名空间输出 JSON（`LOG_FORMAT=json`，可切 `text`）。
+  每条日志带 `task_id`；Agent/工具日志还带 `node_id`/`agent_role`。
+  **不记录原始 prompt/输出/密钥**，只记长度、SQL 哈希、token、耗时。
+- **成本计量**：每次模型调用按 `LLM_COST_PER_1K` 的单价汇总到任务结果
+  （`cost` / `cost_by_route` / `cost_by_agent`）和评测报告；单位是本地端点**积分**，不是货币。
+- **进程内指标**：`GET /metrics`（需要 `tasks:read`）返回任务状态、Token 与成本：
+
+```bash
+curl -s localhost:8000/metrics -H "Authorization: Bearer $API_KEY"
+```
+
+单进程口径、重启清零；OTel / Prometheus / 跨进程持久化指标留到部署阶段。
 
 ## 开发约定
 
