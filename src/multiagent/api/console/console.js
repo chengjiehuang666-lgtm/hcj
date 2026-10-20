@@ -7,6 +7,7 @@ const state = {
   selected: null,
   es: null,
   timer: null,
+  authFailed: false,
 };
 
 const EVENTS = [
@@ -33,11 +34,22 @@ async function api(path, options = {}) {
   let body = null;
   try { body = text ? JSON.parse(text) : null; } catch (_) { body = text; }
   if (!response.ok) {
-    if (response.status === 401) $("conn").className = "dot off";
     const detail = body && body.detail ? JSON.stringify(body.detail) : String(body || "");
-    throw new Error(`HTTP ${response.status}: ${detail.slice(0, 300)}`);
+    const error = new Error(`HTTP ${response.status}: ${detail.slice(0, 300)}`);
+    error.status = response.status;
+    if (response.status === 401) $("conn").className = "dot off";
+    throw error;
   }
   return body;
+}
+
+function toastAuth() {
+  if (state.authFailed) return;
+  state.authFailed = true;
+  toast(
+    "API Key 无效：请填 .env 中 API_KEYS 的 operator/admin key（sk-local-…），" +
+    "不要用 LLM_PRIMARY_API_KEY（sk-U_…）。填写后点“保存”。"
+  );
 }
 
 const fmtInt = (n) => Number(n || 0).toLocaleString("zh-CN");
@@ -99,6 +111,7 @@ async function loadTasks() {
       list.append(li);
     }
   } catch (error) {
+    if (error.status === 401) { toastAuth(); return; }
     toast(`加载任务失败：${error.message}`);
   }
 }
@@ -330,6 +343,7 @@ async function refreshSelected() {
     const body = await api(`/tasks/${state.selected}`);
     renderDetail(body);
   } catch (error) {
+    if (error.status === 401) { toastAuth(); return; }
     toast(`加载任务失败：${error.message}`);
   }
 }
@@ -369,6 +383,7 @@ async function loadMetrics() {
       tr.append(a, b); routeBody.append(tr);
     }
   } catch (error) {
+    if (error.status === 401) { toastAuth(); return; }
     if (state.key) toast(`加载指标失败：${error.message}`);
   }
 }
@@ -406,12 +421,23 @@ async function decide(decision) {
 function bind() {
   $("save-key").addEventListener("click", async () => {
     state.key = $("api-key").value.trim();
+    state.authFailed = false;
     sessionStorage.setItem("ma_api_key", state.key);
-    toast(state.key ? "Key 已保存（仅在本浏览器 sessionStorage）" : "已清除 Key");
+    try {
+      await api("/tasks?limit=1");
+      toast(state.key ? "Key 有效，已保存（仅本浏览器 sessionStorage）" : "已清除 Key");
+    } catch (error) {
+      if (error.status === 401) { toastAuth(); return; }
+      toast(`Key 校验失败：${error.message}`);
+      return;
+    }
     await checkHealth();
     await loadTasks();
     await loadMetrics();
     if (state.selected) openSSE(state.selected);
+  });
+  $("api-key").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { event.preventDefault(); $("save-key").click(); }
   });
   $("refresh").addEventListener("click", () => { loadTasks(); loadMetrics(); });
   $("submit-form").addEventListener("submit", submitTask);
@@ -430,7 +456,7 @@ async function init() {
     $("submit-hint").textContent = "鉴权开启时请先填写 API Key（operator/admin 才能提交）。";
   }
   state.timer = setInterval(() => {
-    if (document.hidden) return;
+    if (document.hidden || state.authFailed) return;
     loadTasks();
     loadMetrics();
     if (state.selected) refreshSelected();
