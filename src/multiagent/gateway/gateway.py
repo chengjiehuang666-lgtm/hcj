@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 
+from ..observability import current_context, log_event
 from .base import (
     AllProvidersFailedError,
     CallRecord,
@@ -65,22 +66,36 @@ class LLMGateway:
                 causes.append(exc)
                 continue
 
-            self.history.append(
-                CallRecord(
-                    provider=response.provider,
-                    model=response.model,
-                    ok=True,
-                    total_tokens=response.total_tokens,
-                    degraded=index > 0,
-                    chain=list(chain),
-                    route=route,
-                    duration_ms=int((time.perf_counter() - started) * 1000),
-                    input_tokens=response.input_tokens,
-                    output_tokens=response.output_tokens,
-                )
+            context = current_context()
+            record = CallRecord(
+                provider=response.provider,
+                model=response.model,
+                ok=True,
+                total_tokens=response.total_tokens,
+                degraded=index > 0,
+                chain=list(chain),
+                route=route,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                input_tokens=response.input_tokens,
+                output_tokens=response.output_tokens,
+                task_id=context["task_id"],
+                node_id=context["node_id"],
+                agent_role=context["agent_role"],
+            )
+            self.history.append(record)
+            log_event(
+                "model_call",
+                route=route,
+                provider=response.provider,
+                model=response.model,
+                tokens=response.total_tokens,
+                duration_ms=record.duration_ms,
+                degraded=index > 0,
+                ok=True,
             )
             return response
 
+        context = current_context()
         self.history.append(
             CallRecord(
                 provider="",
@@ -90,7 +105,18 @@ class LLMGateway:
                 chain=list(chain),
                 route=route,
                 duration_ms=int((time.perf_counter() - started) * 1000),
+                task_id=context["task_id"],
+                node_id=context["node_id"],
+                agent_role=context["agent_role"],
             )
+        )
+        log_event(
+            "model_call",
+            level=30,
+            route=route,
+            failures=len(failures),
+            duration_ms=self.history[-1].duration_ms,
+            ok=False,
         )
         raise AllProvidersFailedError(failures, causes)
 

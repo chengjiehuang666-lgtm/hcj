@@ -14,6 +14,7 @@ from .asyncutil import run_async
 from .config import Settings
 from .graph import AnalysisPipeline
 from .graph.pipeline import new_task_event
+from .observability import configure_logging
 from .security.dlp import redact_structure, redact_text
 
 DEFAULT_QUESTION = "分析上月华东区销售额下滑的原因"
@@ -40,6 +41,7 @@ def _print_outcome(outcome) -> int:
     print(f"状态      : {outcome.status}")
     print(f"耗时      : {outcome.duration_ms / 1000:.1f} 秒")
     print(f"Token     : {outcome.total_tokens}（输入 {outcome.total_input_tokens} / 输出 {outcome.total_output_tokens}）")
+    print(f"成本      : {outcome.total_cost:.4f}（按调用点/Agent 明细见 /metrics）")
     print("=" * 72)
 
     if outcome.status != "ok":
@@ -133,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     settings = Settings()
+    configure_logging(settings)
     event = new_task_event(args.question, settings=settings)
     print(f"▶ 提交需求：{redact_text(args.question)[0]}")
     print(f"▶ 模型：{settings.primary.provider}/{settings.primary.model} "

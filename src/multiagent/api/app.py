@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field
 from ..config import Settings
 from ..graph import AnalysisPipeline
 from ..graph.pipeline import PipelineOutcome, new_task_event
+from ..observability import build_metrics, configure_logging, log_event, set_task_id
 from ..security import (
     PERMISSIONS,
     Principal,
@@ -87,6 +88,10 @@ def _outcome_to_result(outcome: PipelineOutcome, *, dlp: bool = True) -> dict[st
         "total_tokens": outcome.total_tokens,
         "duration_ms": outcome.duration_ms,
         "tokens_by_route": outcome.tokens_by_route,
+        # W10：成本计量（按调用点 / Agent；单位见配置 cost_unit，本地端点是积分）
+        "cost": outcome.total_cost,
+        "cost_by_route": outcome.cost_by_route,
+        "cost_by_agent": outcome.cost_by_agent,
         # 失败/驳回的稳定错误码与可重试性（熔断：BUDGET_EXCEEDED/STEP_LIMIT/...）
         "error": outcome.error,
         "error_code": outcome.error_code,
@@ -177,6 +182,7 @@ def create_app(
     pipeline_factory: PipelineFactory | None = None,
 ) -> FastAPI:
     app_settings = settings or Settings()
+    configure_logging(app_settings)
     factory = pipeline_factory or _default_pipeline_factory
     registry = TaskRegistry()
     #: 后台任务必须保存强引用：fire-and-forget 的 Task 存在被 GC 回收的风险
@@ -265,6 +271,11 @@ def create_app(
         try:
             record.status = "running"
             record.error = None
+            set_task_id(record.task_id)
+            log_event(
+                "task_resumed" if resume_value is not None else "task_started",
+                question_len=len(record.question or ""),
+            )
             record.publish(
                 "task_resumed" if resume_value is not None else "task_started",
                 question=record.question,
@@ -318,6 +329,8 @@ def create_app(
                     status=record.status,
                     error=record.error,
                     summary=(record.result or {}).get("summary", ""),
+                    tokens=(record.result or {}).get("total_tokens"),
+                    cost=(record.result or {}).get("cost"),
                 )
 
     # ------------------------------------------------------------------ 路由
@@ -478,6 +491,18 @@ def create_app(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    @app.get("/metrics")
+    async def metrics(
+        _principal: Principal = Depends(require("tasks:read")),
+    ) -> dict[str, Any]:
+        """W10 进程内指标：任务状态、Token 与成本（按 Agent/调用点）。
+
+        单进程口径，重启清零；跨进程/持久化留到部署阶段。
+        """
+        body = build_metrics(registry.all())
+        body["cost_unit"] = app_settings.cost_unit
+        return body
 
     return app
 

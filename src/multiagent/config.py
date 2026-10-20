@@ -150,6 +150,21 @@ class Settings(BaseSettings):
     #: 启用鉴权但未配置任何 Key 时，API 启动会直接失败（fail closed）。
     api_keys: str = ""
 
+    # ---- 可观测（W10）----
+    #: 日志级别与格式；json 便于采集，text 便于本地阅读。
+    log_level: str = "INFO"
+    log_format: Literal["json", "text"] = "json"
+    #: 模型单价（每 1k token）。本地端点的单位是**积分**，不是货币；
+    #: 用于相对成本比较，不参与计费。值为 0 表示未配置（只记 token）。
+    llm_cost_per_1k: dict[str, float] = Field(
+        default_factory=lambda: {
+            "deepseek-v4.1-flash": 0.0355,
+            "glm-5.3": 0.1699,
+            "deepseek-v4-pro": 0.1309,
+        }
+    )
+    cost_unit: str = "credits"
+
     # ---- 执行预算默认值（对应契约 TaskEvent.budget）----
     default_max_steps: int = 30
     # 任务级 Token 熔断阈值，即《实施路线图》待定项 D2。

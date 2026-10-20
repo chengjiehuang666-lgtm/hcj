@@ -33,12 +33,10 @@ from typing import Annotated, Any, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from ..agents import AgentContext, BaseAgent, build_agent_registry
 from ..config import Settings, get_settings
-from ..memory import MemoryStore
-from ..security import scan_input
 from ..contracts import (
     AgentInvocation,
     AgentResult,
@@ -54,6 +52,9 @@ from ..contracts import (
     to_wire,
 )
 from ..gateway import build_router_from_settings
+from ..memory import MemoryStore
+from ..observability import log_event, node_context, set_task_id, summarize_calls
+from ..security import scan_input
 from ..tools import SqlSandbox
 
 # 业务时区（东八区）。平台面向国内业务，统一用它，避免「上月」算错月份。
@@ -170,6 +171,10 @@ class PipelineOutcome:
     retryable: bool | None = None
     #: 本次执行使用的 DAG 版本（1 = 首版；重规划后递增）
     revision: int = 1
+    #: W10 成本计量：按调用点 / Agent 汇总（token、成本、耗时）
+    cost_by_route: dict[str, dict[str, Any]] = field(default_factory=dict)
+    cost_by_agent: dict[str, dict[str, Any]] = field(default_factory=dict)
+    total_cost: float = 0.0
 
     def outputs_for_role(self, role: str) -> list[dict[str, Any]]:
         """按 agent_role 取该角色所有节点的 outputs（按发生顺序，结果稳定）。
@@ -663,10 +668,11 @@ class AnalysisPipeline:
                     budget=(state.get("task_event") or {}).get("budget"),
                 )
                 try:
-                    result = await asyncio.wait_for(
-                        agent.invoke(inv, ctx), timeout=float(timeout)
-                    )
-                except asyncio.TimeoutError:
+                    with node_context(node.node_id, node.agent_role.value):
+                        result = await asyncio.wait_for(
+                            agent.invoke(inv, ctx), timeout=float(timeout)
+                        )
+                except TimeoutError:
                     last_error = PipelineNodeFailed(
                         node.node_id,
                         "TIMEOUT",
@@ -866,13 +872,14 @@ class AnalysisPipeline:
         resume: bool = False,
         resume_value: Any = None,
     ) -> PipelineOutcome:
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
         from psycopg.rows import dict_row
         from psycopg_pool import AsyncConnectionPool
 
-        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-
         started = time.perf_counter()
         task_id = str(event.task_id)
+        # W10：task_id 贯穿整个调用链（网关/Agent/工具日志与 CallRecord 自动携带）
+        set_task_id(task_id)
         # 输入侧安全兜底（W9）：API 提交前已拦一次；CLI/评测/直调也必须拦，
         # 否则安全基线只在 REST 入口生效。命中时不建图、不连库、不调模型。
         if self.settings.security_enabled:
@@ -1076,10 +1083,31 @@ class AnalysisPipeline:
         if unmapped := getattr(router, "unmapped_routes", None):
             # 路由表漏配不是致命错误（会退回默认档），但必须能被发现
             outcome.error = f"路由表未配置的调用点: {sorted(unmapped)}"
+        outcome = self._apply_metering(outcome)
         # 结论沉淀（best-effort）：门槛见 memory.distill_memory（任务成功 + 评审未否决）。
         # 失败只记录不抛出——记忆是增强，不是任务成功的必要条件。
         if self.settings.memory_sink_enabled and outcome.status == "ok":
             await self._sink_memory(outcome)
+        return outcome
+
+    def _apply_metering(self, outcome: PipelineOutcome) -> PipelineOutcome:
+        """W10：按调用点 / Agent 汇总 token 与成本，并写一条任务级结构化日志。"""
+        summary = summarize_calls(
+            outcome.call_records, self.settings.llm_cost_per_1k
+        )
+        outcome.cost_by_route = summary["by_route"]
+        outcome.cost_by_agent = summary["by_agent"]
+        outcome.total_cost = summary["total_cost"]
+        log_event(
+            "task_finished",
+            status=outcome.status,
+            tokens=outcome.total_tokens,
+            cost=outcome.total_cost,
+            cost_unit=self.settings.cost_unit,
+            duration_ms=outcome.duration_ms,
+            revision=outcome.revision,
+            error_code=outcome.error_code,
+        )
         return outcome
 
     @staticmethod
@@ -1121,7 +1149,7 @@ class AnalysisPipeline:
         except Exception:  # noqa: BLE001 — 部分状态的形状可能不完整
             summary = ""
         status = "rejected" if exc.code == "APPROVAL_REJECTED" else "failed"
-        return PipelineOutcome(
+        outcome = PipelineOutcome(
             task_id=task_id,
             status=status,
             blackboard=dict(state.get("blackboard") or {}),
@@ -1140,6 +1168,7 @@ class AnalysisPipeline:
             retryable=exc.retryable,
             revision=revision,
         )
+        return self._apply_metering(outcome)
 
     def _awaiting_outcome(
         self,
@@ -1159,7 +1188,7 @@ class AnalysisPipeline:
             summary = _sink_summary(dag, node_outputs) if dag else ""
         except Exception:  # noqa: BLE001
             summary = ""
-        return PipelineOutcome(
+        outcome = PipelineOutcome(
             task_id=task_id,
             status="awaiting_approval",
             blackboard=dict(state.get("blackboard") or {}),
@@ -1175,6 +1204,7 @@ class AnalysisPipeline:
             approval_requests=requests,
             revision=revision,
         )
+        return self._apply_metering(outcome)
 
     async def load_saved_task(self, task_id: str) -> TaskEvent | None:
         """从 checkpoint 读回任务的原始 TaskEvent（API 重启后审批/恢复用）。
@@ -1182,10 +1212,9 @@ class AnalysisPipeline:
         thread_id 就是 API 的 task_id（提交时只创建一次 TaskEvent），因此进程重启后
         仍能把「哪个任务、什么预算、什么截止时间」从 PostgreSQL 找回来。
         """
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
         from psycopg.rows import dict_row
         from psycopg_pool import AsyncConnectionPool
-
-        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
         pool = AsyncConnectionPool(
             conninfo=self.settings.postgres_dsn,

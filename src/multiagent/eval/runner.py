@@ -26,8 +26,8 @@ from ..asyncutil import run_async
 from ..config import Settings
 from ..graph import AnalysisPipeline
 from ..graph.pipeline import TZ_CN, new_task_event
+from ..observability import configure_logging
 from .cases import CASES, EvalCase, get_cases
-
 
 # --------------------------------------------------------------------- 打分
 
@@ -77,6 +77,8 @@ class CaseResult:
     route_tokens: dict[str, dict[str, int]] = field(default_factory=dict)
     #: 场景归属（W8：每场景 ≥20 与分场景成功率）
     scenario: str = "analysis"
+    #: W10 成本计量（单位见 Settings.cost_unit；本地端点是积分）
+    cost: float = 0.0
     #: 检索阶段实际取到的知识文档与片段数——RAG 回归的结构性证据
     retrieved_docs: list[str] = field(default_factory=list)
     knowledge_count: int = 0
@@ -295,6 +297,15 @@ class EvalReport:
         return statistics.fmean(data) if data else 0.0
 
     @property
+    def total_cost(self) -> float:
+        return round(sum(r.cost for r in self.results), 6)
+
+    @property
+    def mean_cost(self) -> float:
+        data = [r.cost for r in self.results if r.status == "ok"]
+        return statistics.fmean(data) if data else 0.0
+
+    @property
     def max_tokens(self) -> int:
         data = self._tokens()
         return max(data) if data else 0
@@ -399,6 +410,7 @@ async def run_cases(settings: Settings, cases: list[EvalCase]) -> EvalReport:
                 tokens=outcome.total_tokens,
                 input_tokens=outcome.total_input_tokens,
                 output_tokens=outcome.total_output_tokens,
+                cost=outcome.total_cost,
                 failed_checks=failed,
                 hit_forbidden=forbidden,
                 insufficient_data=insufficient,
@@ -493,6 +505,8 @@ def render_markdown(report: EvalReport) -> str:
     add(f"| 平均 Token/任务 | {report.mean_tokens:,.0f} |")
     add(f"| P95 Token/任务 | {report.p95_tokens:,} |")
     add(f"| 最大 Token/任务 | {report.max_tokens:,} |")
+    add(f"| 平均成本/任务 | {report.mean_cost:.4f} |")
+    add(f"| 总成本（{report.total_cases} 条） | {report.total_cost:.4f} |")
     suggestion = int(report.max_tokens * 1.5 / 10000 + 0.9999) * 10000
     add(f"| **建议 `DEFAULT_MAX_TOKENS`** | **{suggestion:,}**（最大实测 × 1.5 安全系数，向上取整到万） |")
     add("")
@@ -594,6 +608,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"自动补齐前置用例：{[c.id for c in prereqs]}")
 
     settings = Settings()
+    configure_logging(settings)
     known = {c.id for c in CASES}
     unknown = [c.id for c in cases if c.id not in known]
     if unknown:

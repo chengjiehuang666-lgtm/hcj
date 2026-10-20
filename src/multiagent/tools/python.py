@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import Settings
+from ..observability import log_event
 
 
 class PythonSandboxError(Exception):
@@ -135,6 +136,16 @@ class PythonSandbox:
         duration_ms = int((time.perf_counter() - started) * 1000)
         artifacts = sorted(
             p.name for p in work_dir.iterdir() if p.name != ENTRY_FILENAME
+        )
+        log_event(
+            "tool_finished",
+            level=20 if result["ok"] else 30,
+            tool="python",
+            isolation=isolation,
+            ok=result["ok"],
+            exit_code=result["exit_code"],
+            timed_out=result["timed_out"],
+            duration_ms=duration_ms,
         )
         return PythonResult(
             ok=result["ok"],

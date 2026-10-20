@@ -84,6 +84,9 @@ class TaskRegistry:
     def get(self, task_id: str) -> TaskRecord | None:
         return self._tasks.get(task_id)
 
+    def all(self) -> list[TaskRecord]:
+        return list(self._tasks.values())
+
     def list_recent(self, limit: int = 20) -> list[dict[str, Any]]:
         items = sorted(self._tasks.values(), key=lambda r: r.created_at, reverse=True)
         return [r.summary() for r in items[:limit]]

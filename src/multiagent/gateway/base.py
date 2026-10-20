@@ -143,3 +143,7 @@ class CallRecord:
     duration_ms: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    # ---- W10：task_id 贯穿与按 Agent 归因 ----
+    task_id: str | None = None
+    node_id: str | None = None
+    agent_role: str | None = None

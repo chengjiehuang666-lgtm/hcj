@@ -71,6 +71,15 @@ class FakePipeline:
             ],
             total_tokens=10,
             duration_ms=1,
+            cost_by_route={
+                "analyst_sql": {"calls": 1, "total_tokens": 4, "cost": 0.2,
+                                "input_tokens": 3, "output_tokens": 1, "duration_ms": 1},
+            },
+            cost_by_agent={
+                "analyst": {"calls": 1, "total_tokens": 4, "cost": 0.2,
+                            "input_tokens": 3, "output_tokens": 1, "duration_ms": 1},
+            },
+            total_cost=0.2,
         )
 
 
@@ -224,6 +233,20 @@ def test_result_and_events_are_dlp_redacted() -> None:
 
     events = client.get(f"/tasks/{task_id}/events", headers=_auth("view-key")).text
     assert "13812345678" not in events
+
+
+def test_metrics_aggregates_tokens_and_cost() -> None:
+    client, _ = _client()
+    task_id = client.post(
+        "/tasks", json={"question": "分析华东区"}, headers=_auth("op-key")
+    ).json()["task_id"]
+    _wait(client, task_id)
+    body = client.get("/metrics", headers=_auth("view-key")).json()
+    assert body["tasks"]["total"] == 1
+    assert body["tokens"]["total"] == 10
+    assert body["cost"]["total"] == 0.2
+    assert body["cost"]["by_route"]["analyst_sql"] == 0.2
+    assert body["cost_unit"] == "credits"
 
 
 def test_validation_error_does_not_echo_input() -> None:

@@ -24,6 +24,7 @@ from decimal import Decimal
 from typing import Any
 
 from ..config import Settings
+from ..observability import log_event
 
 
 class SqlToolError(Exception):
@@ -153,10 +154,24 @@ class SqlSandbox:
                     cur.execute(wrapped)
                     raw = cur.fetchall()
         except Exception as exc:
+            log_event(
+                "tool_failed",
+                level=30,
+                tool="sql",
+                sql_hash=sql_hash,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
             raise SqlExecutionError(f"查询执行失败: {exc}") from exc
         duration_ms = int((time.perf_counter() - started) * 1000)
 
         rows = [{k: _jsonify(v) for k, v in row.items()} for row in raw]
+        log_event(
+            "tool_finished",
+            tool="sql",
+            sql_hash=sql_hash,
+            rows=len(rows),
+            duration_ms=duration_ms,
+        )
         return SqlResult(
             sql=body,
             sql_hash=sql_hash,

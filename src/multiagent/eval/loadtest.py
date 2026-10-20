@@ -382,8 +382,10 @@ def render_report(results: list[LevelResult], *, mode: str, extra: dict[str, Any
 
 async def main_async(args) -> int:
     from ..config import Settings
+    from ..observability import configure_logging
 
     settings = Settings()
+    configure_logging(settings)
     levels = [int(x) for x in args.levels.split(",") if x.strip()]
     results: list[LevelResult] = []
     extra: dict[str, Any] = {
