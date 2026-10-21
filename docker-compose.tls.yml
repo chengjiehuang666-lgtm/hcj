@@ -1,0 +1,11 @@
+# W14 TLS overlay：自签证书 + uvicorn HTTPS（8443），HTTP 仅绑定本机。
+# 用法：bash scripts/deploy.sh --tls
+services:
+  app:
+    environment:
+      SSL_CERTFILE: /app/tls/cert.pem
+      SSL_KEYFILE: /app/tls/key.pem
+    volumes:
+      - ./deploy/tls:/app/tls:ro
+    ports:
+      - "8443:8000"

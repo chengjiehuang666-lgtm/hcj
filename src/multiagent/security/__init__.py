@@ -10,10 +10,12 @@
 from .auth import PERMISSIONS, Principal, authenticate, parse_api_keys
 from .dlp import redact_structure, redact_text
 from .input_guard import InputVerdict, scan_input
+from .rate_limit import RateLimiter
 
 __all__ = [
     "PERMISSIONS",
     "Principal",
+    "RateLimiter",
     "authenticate",
     "parse_api_keys",
     "redact_structure",

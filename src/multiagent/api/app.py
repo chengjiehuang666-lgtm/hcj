@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -30,6 +31,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from ..audit import AuditLogger
 from ..config import Settings
 from ..graph import AnalysisPipeline
 from ..graph.pipeline import PipelineOutcome, new_task_event
@@ -37,12 +39,14 @@ from ..observability import build_metrics, configure_logging, log_event, set_tas
 from ..security import (
     PERMISSIONS,
     Principal,
+    RateLimiter,
     authenticate,
     parse_api_keys,
     redact_structure,
     redact_text,
     scan_input,
 )
+from ..security.auth import fingerprint
 from .tasks import TERMINAL_STATUSES, TaskRecord, TaskRegistry, _now_iso
 
 #: 流水线工厂签名：(settings, on_event) -> 具备 run(task_event) 的对象。
@@ -191,6 +195,10 @@ def create_app(
     registry = TaskRegistry()
     #: 后台任务必须保存强引用：fire-and-forget 的 Task 存在被 GC 回收的风险
     background_tasks: set = set()
+    audit = AuditLogger(app_settings)
+    limiter = RateLimiter(
+        app_settings.rate_limit_per_minute, app_settings.rate_limit_burst
+    ) if app_settings.rate_limit_enabled else None
 
     # ---- 鉴权（W9）：启用时 fail closed -------------------------------------
     auth_enabled = bool(app_settings.api_auth_enabled)
@@ -217,6 +225,12 @@ def create_app(
             if token is None and request.url.path.endswith("/events"):
                 token = request.query_params.get("api_key")
             if not token:
+                audit.write(
+                    "auth_failed",
+                    reason="missing_key",
+                    path=request.url.path,
+                    ip=_client_ip(request, app_settings),
+                )
                 raise HTTPException(
                     status_code=401,
                     detail="缺少 API Key（Authorization: Bearer <key>）",
@@ -224,12 +238,28 @@ def create_app(
                 )
             principal = authenticate(token, key_map)
             if principal is None:
+                audit.write(
+                    "auth_failed",
+                    reason="invalid_key",
+                    path=request.url.path,
+                    ip=_client_ip(request, app_settings),
+                    key_fingerprint=fingerprint(token),
+                )
                 raise HTTPException(
                     status_code=401,
                     detail="API Key 无效",
                     headers={"WWW-Authenticate": "Bearer"},
                 )
             if permission not in PERMISSIONS.get(principal.role, frozenset()):
+                audit.write(
+                    "auth_failed",
+                    reason="forbidden",
+                    path=request.url.path,
+                    ip=_client_ip(request, app_settings),
+                    actor=principal.key_id,
+                    role=principal.role,
+                    permission=permission,
+                )
                 raise HTTPException(
                     status_code=403,
                     detail=f"角色 {principal.role} 无权执行 {permission}",
@@ -261,6 +291,40 @@ def create_app(
             for item in exc.errors()
         ]
         return JSONResponse(status_code=422, content={"detail": errors})
+
+    # ---- W14：限流 + 安全响应头 --------------------------------------------
+    @app.middleware("http")
+    async def _rate_limit_middleware(request: Request, call_next):
+        path = request.url.path
+        if limiter is not None and (path.startswith("/tasks") or path == "/metrics"):
+            identity = _rate_identity(request, app_settings, key_map)
+            allowed, retry_after = limiter.allow(identity)
+            if not allowed:
+                audit.write(
+                    "rate_limited",
+                    identity=identity,
+                    path=path,
+                    ip=_client_ip(request, app_settings),
+                )
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "请求过于频繁，请稍后重试"},
+                    headers={"Retry-After": str(max(1, math.ceil(retry_after)))},
+                )
+        return await call_next(request)
+
+    @app.middleware("http")
+    async def _security_headers_middleware(request: Request, call_next):
+        response = await call_next(request)
+        if app_settings.security_headers_enabled:
+            response.headers.setdefault("X-Content-Type-Options", "nosniff")
+            response.headers.setdefault("X-Frame-Options", "DENY")
+            response.headers.setdefault("Referrer-Policy", "no-referrer")
+            if _is_https(request):
+                response.headers.setdefault(
+                    "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+                )
+        return response
 
     async def _execute(record: TaskRecord, *, resume_value: dict[str, Any] | None = None) -> None:
         async def on_event(name: str, payload: dict[str, Any]) -> None:
@@ -328,13 +392,23 @@ def create_app(
         finally:
             if record.status in TERMINAL_STATUSES:
                 record.finished_at = _now_iso()
+                result = record.result or {}
+                audit.write(
+                    "task_finished",
+                    task_id=record.task_id,
+                    status=record.status,
+                    tokens=result.get("total_tokens"),
+                    cost=result.get("cost"),
+                    duration_ms=result.get("duration_ms"),
+                    error_code=result.get("error_code"),
+                )
                 record.publish(
                     "task_finished",
                     status=record.status,
                     error=record.error,
-                    summary=(record.result or {}).get("summary", ""),
-                    tokens=(record.result or {}).get("total_tokens"),
-                    cost=(record.result or {}).get("cost"),
+                    summary=result.get("summary", ""),
+                    tokens=result.get("total_tokens"),
+                    cost=result.get("cost"),
                 )
 
     # ------------------------------------------------------------------ 路由
@@ -352,7 +426,7 @@ def create_app(
     @app.post("/tasks", response_model=SubmitResponse, status_code=202)
     async def submit(
         request: SubmitRequest,
-        _principal: Principal = Depends(require("tasks:submit")),
+        principal: Principal = Depends(require("tasks:submit")),
     ) -> SubmitResponse:
         # 输入侧安全过滤（W9）：命中注入/敏感词直接 400，不建任务、不调模型。
         verdict = scan_input(
@@ -361,6 +435,14 @@ def create_app(
             enabled=app_settings.security_enabled,
         )
         if not verdict.allowed:
+            audit.write(
+                "input_blocked",
+                actor=principal.key_id,
+                role=principal.role,
+                rule=verdict.rule,
+                question_len=len(request.question),
+                question_sha256=AuditLogger.question_digest(request.question),
+            )
             raise HTTPException(
                 status_code=400,
                 detail={
@@ -371,6 +453,14 @@ def create_app(
             )
         question = verdict.text
         task_id = str(uuid.uuid4())
+        audit.write(
+            "task_submit",
+            actor=principal.key_id,
+            role=principal.role,
+            task_id=task_id,
+            question_len=len(question),
+            question_sha256=AuditLogger.question_digest(question),
+        )
         record = registry.create(task_id, question)
         # TaskEvent 只创建一次：task_id 同时是 checkpointer 的 thread_id，
         # HITL 恢复/续跑必须能找回来（此前每次 run 都新生成 UUID，恢复无从下手）。
@@ -427,6 +517,14 @@ def create_app(
         record.status = "running"
         # 审计：启用鉴权时审批人取 Key 指纹，调用方无法自称 approver
         approver = principal.key_id if auth_enabled else body.approver
+        audit.write(
+            "approval",
+            actor=principal.key_id,
+            role=principal.role,
+            task_id=task_id,
+            decision=body.decision,
+            comment_len=len(body.comment or ""),
+        )
         record.publish(
             "approval_received",
             decision=body.decision,
@@ -531,6 +629,28 @@ def _bearer_token(request: Request) -> str | None:
     if scheme.lower() != "bearer" or not token.strip():
         return None
     return token.strip()
+
+
+def _client_ip(request: Request, settings: Settings) -> str:
+    if settings.trust_forwarded_for:
+        forwarded = request.headers.get("x-forwarded-for", "")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_identity(request: Request, settings: Settings, key_map: dict[str, str]) -> str:
+    """有效 Key 按指纹分桶；无 Key/非法 Key 按 IP 分桶（防止轮换非法 Key 绕过限流）。"""
+    token = _bearer_token(request)
+    if token and authenticate(token, key_map) is not None:
+        return f"key:{fingerprint(token)}"
+    return f"ip:{_client_ip(request, settings)}"
+
+
+def _is_https(request: Request) -> bool:
+    if request.url.scheme == "https":
+        return True
+    return request.headers.get("x-forwarded-proto", "").lower() == "https"
 
 
 def _sse(payload: dict[str, Any], *, dlp: bool = True) -> str:

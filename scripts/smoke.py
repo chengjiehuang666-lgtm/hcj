@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import ssl
 import sys
 import time
 import urllib.error
@@ -25,6 +26,9 @@ from multiagent.config import Settings  # noqa: E402
 BASE = os.getenv("SMOKE_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 QUESTION = os.getenv("SMOKE_QUESTION", "华东区 2026 年 9 月的销售额是多少？")
 TIMEOUT_S = int(os.getenv("SMOKE_TIMEOUT_S", "300"))
+#: 自签证书场景（--tls）跳过校验；生产正式证书不应设置
+INSECURE = os.getenv("SMOKE_INSECURE", "0") == "1"
+SSL_CONTEXT = ssl._create_unverified_context() if INSECURE and BASE.startswith("https") else None
 
 
 def call(method: str, path: str, payload: dict | None = None, key: str | None = None):
@@ -33,7 +37,8 @@ def call(method: str, path: str, payload: dict | None = None, key: str | None = 
     if key:
         headers["Authorization"] = f"Bearer {key}"
     req = urllib.request.Request(BASE + path, data=data, method=method, headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as response:
+    kwargs = {"context": SSL_CONTEXT} if SSL_CONTEXT else {}
+    with urllib.request.urlopen(req, timeout=30, **kwargs) as response:
         return response.status, json.loads(response.read())
 
 

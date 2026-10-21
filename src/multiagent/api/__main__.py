@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
+from ..config import Settings
 from .app import create_app
 
 
@@ -24,14 +26,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
 
+    settings = Settings()
+    kwargs: dict = {}
+    if settings.ssl_certfile and settings.ssl_keyfile:
+        for path in (settings.ssl_certfile, settings.ssl_keyfile):
+            if not Path(path).is_file():
+                print(f"✗ TLS 证书/私钥不存在: {path}", file=sys.stderr)
+                return 2
+        kwargs["ssl_certfile"] = settings.ssl_certfile
+        kwargs["ssl_keyfile"] = settings.ssl_keyfile
+
     import uvicorn
 
-    kwargs: dict = {}
     if sys.platform == "win32":
         # 覆盖 uvicorn 的 Windows 默认值，否则流水线里的 psycopg 异步连接会失败
         kwargs["loop"] = "asyncio:SelectorEventLoop"
 
-    uvicorn.run(create_app(), host=args.host, port=args.port, **kwargs)
+    uvicorn.run(create_app(settings=settings), host=args.host, port=args.port, **kwargs)
     return 0
 
 

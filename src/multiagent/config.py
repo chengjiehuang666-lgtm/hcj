@@ -150,6 +150,22 @@ class Settings(BaseSettings):
     #: 启用鉴权但未配置任何 Key 时，API 启动会直接失败（fail closed）。
     api_keys: str = ""
 
+    # ---- 安全/运维加固（W14）----
+    #: 应用层限流：按 API Key 指纹（无 Key 时按客户端 IP）做令牌桶。
+    rate_limit_enabled: bool = False
+    rate_limit_per_minute: int = 60
+    rate_limit_burst: int = 10
+    #: 是否信任 X-Forwarded-For（置于反向代理后时开启）
+    trust_forwarded_for: bool = False
+    #: 审计日志（JSONL，只追加）；记录认证失败、任务提交/结束、审批、限流等。
+    audit_enabled: bool = False
+    audit_log_path: str = "audit/audit.jsonl"
+    #: 安全响应头（nosniff / DENY / no-referrer；HTTPS 下加 HSTS）
+    security_headers_enabled: bool = True
+    #: 可选 TLS：两者都非空时 uvicorn 以 HTTPS 启动（自签或正式证书）
+    ssl_certfile: str = ""
+    ssl_keyfile: str = ""
+
     # ---- 可观测（W10）----
     #: 日志级别与格式；json 便于采集，text 便于本地阅读。
     log_level: str = "INFO"

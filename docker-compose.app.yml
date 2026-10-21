@@ -30,9 +30,11 @@ services:
       EMBEDDING_CACHE_DIR: /app/.model_cache
       PYTHON_SANDBOX_MODE: subprocess
     ports:
-      - "8000:8000"
+      # 默认只绑定本机；对外请用 docker-compose.tls.yml（8443）或反代
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./.model_cache:/app/.model_cache:ro
+      - ./audit:/app/audit
     depends_on:
       postgres:
         condition: service_healthy
