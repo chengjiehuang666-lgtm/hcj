@@ -1,6 +1,6 @@
 # 多 Agent 接入协作项目
 
-企业级多 Agent 智能协作平台。**W1–W12 已完成、M1/M2/M3 达成；W13 增补轻量控制台**（单人全职开发，计划与范围见《实施路线图》）。
+企业级多 Agent 智能协作平台。**W1–W12 已完成、M1/M2/M3 达成；W13 控制台 + W13.1 知识库扩容；W14 安全/运维加固（HTTPS/限流/审计）**。
 
 ## 唯一事实源
 
@@ -143,7 +143,8 @@ python -m multiagent.memory --stats               # 长期记忆维护（--searc
 ```bash
 cp .env.example .env           # 填 API_KEYS 与模型 Key
 mkdir -p .model_cache          # embedding 缓存（容器只读挂载）
-bash scripts/deploy.sh         # 构建 app + PG/Redis，健康检查 + 冒烟
+bash scripts/deploy.sh         # 构建 app + PG/Redis，健康检查 + 冒烟（HTTP，仅本机）
+bash scripts/deploy.sh --tls   # 同上 + HTTPS 8443（自签证书，浏览器会告警）
 bash scripts/rollback.sh v0.14-w11-calibration   # 按 Git 标签回滚并冒烟
 ```
 
@@ -191,8 +192,20 @@ curl -s -X POST localhost:8000/tasks/<task_id>/approval \
    覆盖 API 结果、SSE、CLI 与长期记忆；422 校验错误不回显原始输入。
 4. **SSE 的例外**：浏览器 `EventSource` 不能自定义 Header，因此只有
    `/tasks/{id}/events` 允许 `?api_key=`；Key 可能进入访问日志，生产应置于 HTTPS 反代后。
-5. **未做**：限流、CORS、TLS/Vault、OIDC/RBAC+ABAC、外部检索内容隔离标注、
-   财务数字与模型层 DLP、审计日志持久化、Key 轮换——均在《实施路线图》§3.14 记录。
+5. **未做**：CORS、Vault、OIDC/RBAC+ABAC、外部检索内容隔离标注、财务数字与模型层 DLP、
+   Key 轮换——均在《实施路线图》§3.14 记录。
+
+## 运维加固（W14）
+
+- **HTTPS**：`bash scripts/deploy.sh --tls` 生成自签证书并以 HTTPS（8443）启动，
+  HTTP 仅绑定 `127.0.0.1:8000`；生产请换正式证书（Caddy/nginx + Let's Encrypt）。
+- **限流**：按有效 API Key 指纹（无 Key/非法 Key 按 IP）令牌桶，默认 60 次/分、突发 10；
+  超限返回 `429` + `Retry-After`。单进程口径，多副本需换 Redis。
+- **审计日志**：`audit/audit.jsonl` 只追加，记录认证失败、任务提交/结束、审批、限流；
+  只记 actor/task_id/hash/长度，不落原始问题与 Key。
+- **安全响应头**：`nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`；
+  HTTPS 下加 HSTS。
+- 配置见 `.env.example` 的 `RATE_LIMIT_*` / `AUDIT_*` / `SSL_*`。
 
 代码里的 `API_AUTH_ENABLED` 默认 `false`（兼容本地 stub 与单测）；`.env.example`
 默认 `true` 并放占位 Key。**共享或对外环境必须开启鉴权。**
